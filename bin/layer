@@ -1,0 +1,63 @@
+#!/bin/sh
+# layer - thin dispatcher over the libexec layer-* tools (the strat clone)
+#
+# Usage:
+#   layer enable  <name>
+#   layer disable <name>
+#   layer enter   <name> [command [args...]]
+#   layer list
+
+set -eu
+
+LIBEXEC_DIR="${LIBEXEC_DIR:-/enux/libexec}"
+LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+
+usage()
+{
+    echo "usage: layer enable <name>" >&2
+    echo "       layer disable <name>" >&2
+    echo "       layer enter <name> [command [args...]]" >&2
+    echo "       layer list" >&2
+    exit 2
+}
+
+is_mounted_layer()
+{
+    awk -v p="$LAYER_DIR/$1" '$5 == p { found=1 } END { exit !found }' \
+        /proc/self/mountinfo
+}
+
+[ "$#" -ge 1 ] || usage
+cmd="$1"
+shift
+
+case "$cmd" in
+enable)
+    [ "$#" -eq 1 ] || usage
+    exec "$LIBEXEC_DIR/layer-enable" "$1"
+    ;;
+disable)
+    [ "$#" -eq 1 ] || usage
+    exec "$LIBEXEC_DIR/layer-disable" "$1"
+    ;;
+enter)
+    [ "$#" -ge 1 ] || usage
+    exec "$LIBEXEC_DIR/layer-enter" "$@"
+    ;;
+list)
+    [ -d "$LAYER_DIR" ] || { echo "no layers installed"; exit 0; }
+    for d in "$LAYER_DIR"/*/; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        if is_mounted_layer "$name"; then
+            state="enabled"
+        else
+            state="disabled"
+        fi
+        printf '%-20s %s\n' "$name" "$state"
+    done
+    ;;
+*)
+    usage
+    ;;
+esac

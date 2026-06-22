@@ -1,0 +1,7 @@
+NAME="ENux"
+ID=enux
+ID_LIKE=debian
+VERSION_ID="6.0-alpha"
+PRETTY_NAME="ENux 6.0 Alpha (The ENux Layer)"
+HOME_URL="https://github.com/ENux-Distro/ENux"
+SUPPORT_URL="https://github.com/ENux-Distro/ENux/issues"

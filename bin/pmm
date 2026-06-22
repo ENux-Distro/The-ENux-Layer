@@ -1,0 +1,154 @@
+#!/bin/sh
+# pmm - package manager manager: one front-end over each layer's native
+#       package manager (the Bedrock pmm clone).
+#
+# Usage:
+#   pmm <operation> [layer:<name>] [packages...]
+#
+# Operations:
+#   install   install packages
+#   remove    remove packages
+#   update    refresh the package database / metadata
+#   upgrade   upgrade all installed packages
+#   search    search for a package
+#   list      list installed packages
+#
+# Target layer: an explicit `layer:<name>` argument, otherwise the first
+# layer in enux's exec_order. The native package manager is detected from
+# the layer's rootfs, so `pmm install neofetch` does the right thing
+# whether that layer is Arch (pacman), Fedora (dnf), Alpine (apk)...
+
+set -eu
+
+BIN_DIR="${BIN_DIR:-/enux/bin}"
+LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+
+usage()
+{
+    cat >&2 <<'EOF'
+usage: pmm <operation> [layer:<name>] [packages...]
+
+operations: install remove update upgrade search list
+EOF
+    exit 2
+}
+
+# Detect the native package manager by looking for its binary in the
+# layer's rootfs. No chroot needed - we only stat files.
+detect_pm()
+{
+    root="$1"
+    for pm in pacman apt-get dnf apk xbps-install zypper emerge; do
+        for d in usr/bin bin usr/sbin sbin; do
+            if [ -x "$root/$d/$pm" ]; then
+                echo "$pm"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# Echo the native command for (pm, operation). Packages are appended by
+# the caller. Operations with no sensible mapping echo nothing -> error.
+pm_command()
+{
+    pm="$1"
+    op="$2"
+    case "$pm:$op" in
+    pacman:install)   echo "pacman -S --noconfirm" ;;
+    pacman:remove)    echo "pacman -R --noconfirm" ;;
+    pacman:update)    echo "pacman -Sy" ;;
+    pacman:upgrade)   echo "pacman -Syu --noconfirm" ;;
+    pacman:search)    echo "pacman -Ss" ;;
+    pacman:list)      echo "pacman -Q" ;;
+
+    apt-get:install)  echo "apt-get install -y" ;;
+    apt-get:remove)   echo "apt-get remove -y" ;;
+    apt-get:update)   echo "apt-get update" ;;
+    apt-get:upgrade)  echo "apt-get upgrade -y" ;;
+    apt-get:search)   echo "apt-cache search" ;;
+    apt-get:list)     echo "dpkg -l" ;;
+
+    # dnf update uses makecache, not check-update: check-update exits 100
+    # when updates exist, which would look like a failure under set -e.
+    dnf:install)      echo "dnf install -y" ;;
+    dnf:remove)       echo "dnf remove -y" ;;
+    dnf:update)       echo "dnf makecache" ;;
+    dnf:upgrade)      echo "dnf upgrade -y" ;;
+    dnf:search)       echo "dnf search" ;;
+    dnf:list)         echo "dnf list --installed" ;;
+
+    apk:install)      echo "apk add" ;;
+    apk:remove)       echo "apk del" ;;
+    apk:update)       echo "apk update" ;;
+    apk:upgrade)      echo "apk upgrade" ;;
+    apk:search)       echo "apk search" ;;
+    apk:list)         echo "apk info" ;;
+
+    xbps-install:install)  echo "xbps-install -y" ;;
+    xbps-install:remove)   echo "xbps-remove -y" ;;
+    xbps-install:update)   echo "xbps-install -S" ;;
+    xbps-install:upgrade)  echo "xbps-install -Su" ;;
+    xbps-install:search)   echo "xbps-query -Rs" ;;
+    xbps-install:list)     echo "xbps-query -l" ;;
+
+    zypper:install)   echo "zypper install -y" ;;
+    zypper:remove)    echo "zypper remove -y" ;;
+    zypper:update)    echo "zypper refresh" ;;
+    zypper:upgrade)   echo "zypper update -y" ;;
+    zypper:search)    echo "zypper search" ;;
+    zypper:list)      echo "zypper search --installed-only" ;;
+
+    emerge:install)   echo "emerge" ;;
+    emerge:remove)    echo "emerge --unmerge" ;;
+    emerge:update)    echo "emerge --sync" ;;
+    emerge:upgrade)   echo "emerge -uDN @world" ;;
+    emerge:search)    echo "emerge --search" ;;
+    emerge:list)      echo "qlist -I" ;;
+
+    *) ;;
+    esac
+}
+
+[ "$#" -ge 1 ] || usage
+op="$1"
+shift
+
+case "$op" in
+install|remove|update|upgrade|search|list) ;;
+*) usage ;;
+esac
+
+# Optional explicit target: layer:<name>
+layer=""
+case "${1:-}" in
+layer:*)
+    layer="${1#layer:}"
+    shift
+    ;;
+esac
+
+# Fall back to the first layer in exec_order (read straight from the conf
+# file - the same first-in-order layer `enux exec` would dispatch to).
+if [ -z "$layer" ]; then
+    layer=$(awk -F'=' '/^[ \t]*exec_order/ {gsub(/[ \t]/,"",$2); split($2,a,","); print a[1]; exit}' \
+        "${ENUX_CONF:-/enux/etc/enux.conf}" 2>/dev/null)
+fi
+
+[ -n "$layer" ] || { echo "pmm: no target layer (set one with layer:<name> or enux set-exec-order)" >&2; exit 1; }
+
+root="$LAYER_DIR/$layer"
+[ -d "$root" ] || { echo "pmm: layer '$layer' is not installed" >&2; exit 1; }
+
+pm=$(detect_pm "$root") || {
+    echo "pmm: no supported package manager found in layer '$layer'" >&2
+    exit 1
+}
+
+cmd=$(pm_command "$pm" "$op")
+[ -n "$cmd" ] || { echo "pmm: '$op' is not supported for $pm" >&2; exit 1; }
+
+echo "pmm: [$layer/$pm] $cmd $*"
+# shellcheck disable=SC2086  # $cmd is an intentional multi-word command
+exec "$BIN_DIR/layer" enter "$layer" $cmd "$@"

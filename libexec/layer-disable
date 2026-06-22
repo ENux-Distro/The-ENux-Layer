@@ -1,0 +1,42 @@
+#!/bin/sh
+# layer-disable - reverse of layer-enable
+#
+# Usage: layer-disable <name>
+#
+# Lazy-unmounts (-l) in the reverse order layer-enable mounted them, so a
+# lingering process with its cwd inside the layer (e.g. a leftover
+# gpg-agent from a chroot session) doesn't block teardown - the mount
+# detaches now and the underlying filesystem frees once that process exits.
+
+set -eu
+
+LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: layer-disable <name>" >&2
+    exit 2
+fi
+
+name="$1"
+root="$LAYER_DIR/$name"
+
+is_mounted()
+{
+    awk -v p="$1" '$5 == p { found=1 } END { exit !found }' /proc/self/mountinfo
+}
+
+unmount_if_present()
+{
+    target="$1"
+    if is_mounted "$target"; then
+        umount -l "$target"
+    fi
+}
+
+unmount_if_present "$root/dev/pts"
+unmount_if_present "$root/dev"
+unmount_if_present "$root/sys"
+unmount_if_present "$root/proc"
+unmount_if_present "$root"
+
+echo "layer-disable: '$name' detached"

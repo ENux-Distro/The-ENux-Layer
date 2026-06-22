@@ -1,0 +1,7 @@
+# Build artifact: the init binary is built from the separate init.c repo
+# (make init / make INIT_SRC=...). Not committed.
+/sbin/init
+
+# Installed layer rootfilesystems are runtime/per-build data.
+/layer/*
+!/layer/.keep

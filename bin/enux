@@ -1,0 +1,343 @@
+#!/bin/sh
+# enux - layer lifecycle manager (the brl clone)
+#
+# Owns /enux/etc/enux.conf's [layers] section (exec_order, active) and the
+# install/remove of layer rootfses under /enux/layer/. Mount/chroot
+# mechanics are layer's job, not this command's - enux only ever calls
+# `layer enable/disable`, never touches mounts directly.
+#
+# Usage:
+#   enux install <name> [url-or-tarball-path]
+#   enux remove <name>
+#   enux list
+#   enux show <name>
+#   enux set-exec-order <name> [name...]
+#   enux exec <command> [args...]
+
+set -eu
+
+BIN_DIR="${BIN_DIR:-/enux/bin}"
+LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+ENUX_CONF="${ENUX_CONF:-/enux/etc/enux.conf}"
+
+usage()
+{
+    cat >&2 <<'EOF'
+usage: enux install <name> [url-or-tarball-path]
+       enux remove <name>
+       enux list
+       enux show <name>
+       enux set-exec-order <name> [name...]
+       enux exec <command> [args...]
+EOF
+    exit 2
+}
+
+# --- enux.conf [layers] section helpers ------------------------------
+#
+# Format (shared with init.c's bedrock_conf.c parser):
+#   [layers]
+#   exec_order = name1,name2
+#   active = name1
+
+conf_get()
+{
+    section="$1"; key="$2"
+    [ -f "$ENUX_CONF" ] || return 0
+    awk -v section="$section" -v key="$key" '
+        /^\[/ { cur = substr($0, 2, length($0)-2); next }
+        cur == section {
+            split($0, kv, "=")
+            k = kv[1]; gsub(/^[ \t]+|[ \t]+$/, "", k)
+            if (k == key) {
+                v = substr($0, index($0, "=")+1)
+                gsub(/^[ \t]+|[ \t]+$/, "", v)
+                print v
+                exit
+            }
+        }
+    ' "$ENUX_CONF"
+}
+
+# Set key=value inside [section], creating the section/file if missing.
+conf_set()
+{
+    section="$1"; key="$2"; value="$3"
+    touch "$ENUX_CONF"
+    tmp="$ENUX_CONF.tmp.$$"
+    awk -v section="$section" -v key="$key" -v value="$value" '
+        BEGIN { in_section = 0; done = 0 }
+        /^\[/ {
+            cur = substr($0, 2, length($0)-2)
+            if (in_section && !done) {
+                print key " = " value
+                done = 1
+            }
+            in_section = (cur == section)
+            print
+            next
+        }
+        {
+            if (in_section) {
+                split($0, kv, "=")
+                k = kv[1]; gsub(/^[ \t]+|[ \t]+$/, "", k)
+                if (k == key) {
+                    print key " = " value
+                    done = 1
+                    next
+                }
+            }
+            print
+        }
+        END {
+            if (!done && in_section) {
+                print key " = " value
+                done = 1
+            }
+            if (!done) {
+                print "[" section "]"
+                print key " = " value
+            }
+        }
+    ' "$ENUX_CONF" > "$tmp"
+    mv "$tmp" "$ENUX_CONF"
+}
+
+exec_order_list()
+{
+    order=$(conf_get layers exec_order)
+    [ -n "$order" ] || return 0
+    echo "$order" | tr ',' '\n' | sed 's/^ *//; s/ *$//'
+}
+
+exec_order_add()
+{
+    name="$1"
+    existing=$(exec_order_list | tr '\n' ',' | sed 's/,$//')
+    case ",$existing," in
+    *",$name,"*) return 0 ;;
+    esac
+    if [ -n "$existing" ]; then
+        conf_set layers exec_order "$existing,$name"
+    else
+        conf_set layers exec_order "$name"
+    fi
+}
+
+exec_order_remove()
+{
+    name="$1"
+    new=$(exec_order_list | grep -v "^$name\$" | tr '\n' ',' | sed 's/,$//')
+    conf_set layers exec_order "$new"
+}
+
+# --- rootfs fetch: known layers have a builtin default source --------
+
+# Newest release dir for a linuxcontainers distro (e.g. fedora -> 44).
+# Releases are listed as subdirectories; numeric versions sort correctly
+# with `sort -V`. Named releases (debian's "bookworm" etc.) would need a
+# pinned release arg instead - that path isn't handled here yet.
+lxc_latest_release()
+{
+    distro="$1"
+    curl -sfL "https://images.linuxcontainers.org/images/$distro/" \
+        | grep -oE 'href="[^"/]+/"' \
+        | sed 's/href="//; s|/"||' \
+        | grep -vE '^\.\.$' \
+        | sort -V \
+        | tail -n1
+}
+
+# Resolve a downloadable rootfs.tar.xz under a linuxcontainers image dir.
+# Honors the rule: prefer an explicit "latest" alias if the mirror has
+# one, otherwise pick the newest timestamped upload. Timestamp dirs look
+# like 20260622_02%3A12/ (the %3A is a URL-encoded colon).
+lxc_rootfs_url()
+{
+    distro="$1"
+    release="$2"
+    base="https://images.linuxcontainers.org/images/$distro/$release/amd64/default"
+    listing=$(curl -sfL "$base/") || return 1
+
+    if echo "$listing" | grep -q 'href="latest/"'; then
+        sub="latest/"
+    else
+        sub=$(echo "$listing" \
+            | grep -oE 'href="[0-9]{8}_[0-9]{2}%3A[0-9]{2}/"' \
+            | sed 's/href="//; s/"//' \
+            | sort \
+            | tail -n1)
+    fi
+    [ -n "$sub" ] || return 1
+    echo "$base/${sub}rootfs.tar.xz"
+}
+
+default_source()
+{
+    case "$1" in
+    arch)
+        # Arch ships a permanent version-less "latest" alias.
+        echo "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
+        ;;
+    alpine)
+        # Alpine's minirootfs filename is versioned and has no permanent
+        # "latest" alias - resolve the current one from the listing.
+        base="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64"
+        file=$(curl -sfL "$base/" | grep -oE 'alpine-minirootfs-[0-9.]+-x86_64\.tar\.gz' | head -n1)
+        [ -n "$file" ] && echo "$base/$file"
+        ;;
+    fedora|debian|ubuntu|rockylinux|centos|opensuse|voidlinux)
+        # All served by linuxcontainers with the same layout.
+        release=$(lxc_latest_release "$1")
+        [ -n "$release" ] && lxc_rootfs_url "$1" "$release"
+        ;;
+    *)
+        ;;
+    esac
+}
+
+fetch_and_extract()
+{
+    src="$1"
+    dest="$2"
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+
+    case "$src" in
+    *.tar.zst) ext=tar.zst ;;
+    *.tar.xz)  ext=tar.xz ;;
+    *.tar.gz|*.tgz) ext=tar.gz ;;
+    *) ext=tar ;;
+    esac
+
+    case "$src" in
+    http://*|https://*)
+        archive="$work/rootfs.$ext"
+        curl -fL -o "$archive" "$src"
+        ;;
+    *)
+        [ -f "$src" ] || { echo "enux: no such file: $src" >&2; exit 1; }
+        archive="$src"
+        ;;
+    esac
+
+    case "$archive" in
+    *.tar.zst) tar --use-compress-program=unzstd -xf "$archive" -C "$work" ;;
+    *.tar.xz)  tar -xJf "$archive" -C "$work" ;;
+    *.tar.gz|*.tgz) tar -xzf "$archive" -C "$work" ;;
+    *) echo "enux: unrecognized archive format: $archive" >&2; exit 1 ;;
+    esac
+
+    # Bootstrap tarballs vary on whether they wrap contents in one
+    # top-level dir (root.x86_64/) or not (alpine minirootfs doesn't).
+    entries=$(find "$work" -mindepth 1 -maxdepth 1 ! -name 'rootfs.tar')
+    count=$(echo "$entries" | grep -c .)
+    if [ "$count" -eq 1 ] && [ -d "$entries" ]; then
+        srcdir="$entries"
+    else
+        srcdir="$work"
+    fi
+
+    mv "$srcdir" "$dest.movetmp"
+    rmdir "$dest" 2>/dev/null || true
+    mv "$dest.movetmp" "$dest"
+}
+
+# --- subcommands -------------------------------------------------------
+
+cmd_install()
+{
+    [ "$#" -ge 1 ] || usage
+    name="$1"
+    src="${2:-$(default_source "$name")}"
+    dest="$LAYER_DIR/$name"
+
+    [ -d "$dest" ] && { echo "enux: '$name' is already installed at $dest" >&2; exit 1; }
+    [ -n "$src" ] || {
+        echo "enux: no builtin source for '$name' - pass a URL or tarball path" >&2
+        exit 1
+    }
+
+    echo "enux: fetching $src"
+    fetch_and_extract "$src" "$dest"
+    exec_order_add "$name"
+    echo "enux: '$name' installed at $dest"
+}
+
+cmd_remove()
+{
+    [ "$#" -eq 1 ] || usage
+    name="$1"
+    dest="$LAYER_DIR/$name"
+    [ -d "$dest" ] || { echo "enux: '$name' is not installed" >&2; exit 1; }
+
+    # Never rm -rf a mounted layer - disable it first (see commit history:
+    # this is exactly how a chroot's live /proc and /dev almost got baked
+    # into a squashfs image during testing).
+    "$BIN_DIR/layer" disable "$name"
+    rm -rf "$dest"
+    exec_order_remove "$name"
+    echo "enux: '$name' removed"
+}
+
+cmd_list()
+{
+    active=$(conf_get layers active)
+    [ -d "$LAYER_DIR" ] || { echo "no layers installed"; return 0; }
+    for d in "$LAYER_DIR"/*/; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        marker=" "
+        [ "$name" = "$active" ] && marker="*"
+        printf '%s %s\n' "$marker" "$name"
+    done
+}
+
+cmd_show()
+{
+    [ "$#" -eq 1 ] || usage
+    name="$1"
+    dest="$LAYER_DIR/$name"
+    [ -d "$dest" ] || { echo "enux: '$name' is not installed" >&2; exit 1; }
+    echo "name:       $name"
+    echo "path:       $dest"
+    echo "size:       $(du -sh "$dest" 2>/dev/null | cut -f1)"
+    echo "exec_order: $(exec_order_list | tr '\n' ',' | sed 's/,$//')"
+    "$BIN_DIR/layer" list | awk -v n="$name" '$1==n{print "state:      " $2}'
+}
+
+cmd_set_exec_order()
+{
+    [ "$#" -ge 1 ] || usage
+    for name in "$@"; do
+        [ -d "$LAYER_DIR/$name" ] || {
+            echo "enux: '$name' is not installed" >&2
+            exit 1
+        }
+    done
+    order=$(printf '%s,' "$@")
+    order="${order%,}"
+    conf_set layers exec_order "$order"
+}
+
+cmd_exec()
+{
+    [ "$#" -ge 1 ] || usage
+    first=$(exec_order_list | head -n1)
+    [ -n "$first" ] || { echo "enux: exec_order is empty" >&2; exit 1; }
+    exec "$BIN_DIR/layer" enter "$first" "$@"
+}
+
+[ "$#" -ge 1 ] || usage
+cmd="$1"
+shift
+
+case "$cmd" in
+install)         cmd_install "$@" ;;
+remove)          cmd_remove "$@" ;;
+list)            cmd_list "$@" ;;
+show)             cmd_show "$@" ;;
+set-exec-order)  cmd_set_exec_order "$@" ;;
+exec)            cmd_exec "$@" ;;
+*)               usage ;;
+esac

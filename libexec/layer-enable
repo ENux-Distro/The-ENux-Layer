@@ -1,0 +1,73 @@
+#!/bin/sh
+# layer-enable - make a layer's rootfs usable in a chroot/non-PID-1 environment
+#
+# Usage: layer-enable <name>
+#
+# Bind-mounts the layer onto itself so it gets its own /proc/self/mountinfo
+# entry (without this, tools like pacman that walk mountinfo to find a
+# path's mountpoint fail with bogus "no space" errors - see commit history
+# for the reproduction), then brings in /proc, /sys, /dev, /dev/pts from
+# the host and a copy of resolv.conf for DNS.
+#
+# Idempotent: running this twice on an already-enabled layer is a no-op.
+
+set -eu
+
+LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: layer-enable <name>" >&2
+    exit 2
+fi
+
+name="$1"
+root="$LAYER_DIR/$name"
+
+if [ ! -d "$root" ]; then
+    echo "layer-enable: '$name' is not installed at $root" >&2
+    exit 1
+fi
+
+is_mounted()
+{
+    # Match "<mountpoint> " as a whole field in mountinfo, not a substring,
+    # so /enux/layer/arch doesn't false-match /enux/layer/arch2.
+    awk -v p="$1" '$5 == p { found=1 } END { exit !found }' /proc/self/mountinfo
+}
+
+bind_if_needed()
+{
+    src="$1"
+    dst="$2"
+    if is_mounted "$dst"; then
+        return 0
+    fi
+    mount --bind "$src" "$dst"
+}
+
+# Self-bind first - everything else depends on $root having a mountinfo
+# entry of its own. Without --make-private, the self-bind stays in the
+# same propagation group as the underlying root mount, so every bind we
+# do underneath it (proc, sys, dev...) gets propagated back through both
+# paths to the same directory and shows up twice in mountinfo.
+bind_if_needed "$root" "$root"
+mount --make-private "$root"
+
+mkdir -p "$root/proc" "$root/sys" "$root/dev" "$root/dev/pts"
+bind_if_needed /proc "$root/proc"
+bind_if_needed /sys "$root/sys"
+bind_if_needed /dev "$root/dev"
+bind_if_needed /dev/pts "$root/dev/pts"
+
+# DNS: copy a real resolv.conf into the layer for the chroot session.
+# Many distros ship /etc/resolv.conf as a symlink (Fedora -> /run/systemd/
+# resolve/stub-resolv.conf). If we don't remove that first, cp follows the
+# dangling symlink and writes through an absolute target resolved against
+# the HOST root - the layer ends up with no working resolver, and we've
+# scribbled on the host's /run. Replace it with a plain file instead.
+if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
+    rm -f "$root/etc/resolv.conf"
+    cp -L /etc/resolv.conf "$root/etc/resolv.conf" 2>/dev/null || true
+fi
+
+echo "layer-enable: '$name' ready at $root"

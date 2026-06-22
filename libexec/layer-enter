@@ -1,0 +1,30 @@
+#!/bin/sh
+# layer-enter - enable a layer (if needed) and chroot into it
+#
+# Usage: layer-enter <name> [command [args...]]
+#
+# With no command, drops into the layer's default shell. This is the
+# manual/interactive entry point; layer-enable is what boot-time
+# (init.c) and container setup call on their own.
+
+set -eu
+
+LIBEXEC_DIR="${LIBEXEC_DIR:-/enux/libexec}"
+LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+
+if [ "$#" -lt 1 ]; then
+    echo "usage: layer-enter <name> [command [args...]]" >&2
+    exit 2
+fi
+
+name="$1"
+shift
+root="$LAYER_DIR/$name"
+
+"$LIBEXEC_DIR/layer-enable" "$name"
+
+if [ "$#" -eq 0 ]; then
+    exec chroot "$root" /bin/sh -l
+fi
+
+exec chroot "$root" "$@"
