@@ -3,10 +3,13 @@
 #
 # Usage: layer-disable <name>
 #
-# Lazy-unmounts (-l) in the reverse order layer-enable mounted them, so a
-# lingering process with its cwd inside the layer (e.g. a leftover
-# gpg-agent from a chroot session) doesn't block teardown - the mount
-# detaches now and the underlying filesystem frees once that process exits.
+# Lazy-unmounts (-l) every mount at or under the layer root, deepest-first
+# and repeatedly, until none remain. Draining in a loop matters because a
+# layer can accumulate STACKED mounts (each enable adds binds; an
+# interrupted run can leave several on the same path) - unmounting once
+# would leave the rest behind and block an ISO build. Lazy unmount also
+# means a lingering process with its cwd inside the layer doesn't block
+# teardown: the mount detaches now, the fs frees when that process exits.
 
 set -eu
 
@@ -20,23 +23,27 @@ fi
 name="$1"
 root="$LAYER_DIR/$name"
 
-is_mounted()
+# Every mountpoint at or under $root, deepest first (longest path first),
+# so children unmount before parents.
+mounts_under_root()
 {
-    awk -v p="$1" '$5 == p { found=1 } END { exit !found }' /proc/self/mountinfo
+    awk -v r="$root" '$5 == r || index($5, r "/") == 1 { print $5 }' \
+        /proc/self/mountinfo \
+        | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-
 }
 
-unmount_if_present()
-{
-    target="$1"
-    if is_mounted "$target"; then
-        umount -l "$target"
+pass=0
+while :; do
+    mounts=$(mounts_under_root)
+    [ -z "$mounts" ] && break
+    printf '%s\n' "$mounts" | while IFS= read -r m; do
+        [ -n "$m" ] && umount -l "$m" 2>/dev/null || true
+    done
+    pass=$((pass + 1))
+    if [ "$pass" -ge 50 ]; then
+        echo "layer-disable: '$name' still has mounts after 50 passes" >&2
+        exit 1
     fi
-}
-
-unmount_if_present "$root/dev/pts"
-unmount_if_present "$root/dev"
-unmount_if_present "$root/sys"
-unmount_if_present "$root/proc"
-unmount_if_present "$root"
+done
 
 echo "layer-disable: '$name' detached"

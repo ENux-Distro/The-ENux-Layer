@@ -1,0 +1,46 @@
+#!/bin/sh
+# cross-dispatch - run a command inside whichever layer provides it.
+#
+# The non-FUSE equivalent of Bedrock's crossfs. /enux/cross/bin/<cmd> is a
+# symlink to this script; it looks <cmd> up in the cross index and re-execs
+# it inside the owning layer (via `layer enter`, so the command runs with
+# its own layer's libc and libraries - that is why a foreign binary like
+# Alpine's musl-linked apk works from a glibc base).
+#
+# The index is built by `enux cross`.
+
+set -eu
+
+CROSS_DIR="${CROSS_DIR:-/enux/cross}"
+CROSS_INDEX="${CROSS_INDEX:-$CROSS_DIR/index}"
+BIN_DIR="${BIN_DIR:-/enux/bin}"
+
+# Remove the cross dir from PATH first, so this script's own helpers
+# (basename, awk) and the `layer` it execs resolve to base binaries and
+# never loop back into a cross wrapper (which would recurse forever).
+case ":$PATH:" in
+*":$CROSS_DIR/bin:"*)
+    _np=""; _oifs=$IFS; IFS=:
+    for _p in $PATH; do
+        [ "$_p" = "$CROSS_DIR/bin" ] && continue
+        _np="${_np:+$_np:}$_p"
+    done
+    IFS=$_oifs
+    PATH=$_np; export PATH
+    ;;
+esac
+
+cmd=$(basename "$0")
+
+# Index line: "<cmd> <layer> <absolute-path-inside-layer>"
+entry=$(awk -v c="$cmd" '$1 == c { print $2, $3; exit }' "$CROSS_INDEX" 2>/dev/null || true)
+if [ -z "$entry" ]; then
+    echo "cross: no layer provides '$cmd' (run 'enux cross' to refresh)" >&2
+    exit 127
+fi
+layer=${entry%% *}
+inpath=${entry#* }
+
+# Exec the command's absolute in-layer path so it doesn't depend on PATH
+# resolution inside the chroot.
+exec "$BIN_DIR/layer" enter "$layer" "$inpath" "$@"

@@ -11,6 +11,21 @@ set -eu
 
 LIBEXEC_DIR="${LIBEXEC_DIR:-/enux/libexec}"
 LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+CROSS_DIR="${CROSS_DIR:-/enux/cross}"
+
+# Strip the cross dir from PATH: the mount/chroot machinery must use the
+# base system's own mount/awk/cp, never a layer's cross-dispatched ones.
+case ":$PATH:" in
+*":$CROSS_DIR/bin:"*)
+    _np=""; _oifs=$IFS; IFS=:
+    for _p in $PATH; do
+        [ "$_p" = "$CROSS_DIR/bin" ] && continue
+        _np="${_np:+$_np:}$_p"
+    done
+    IFS=$_oifs
+    PATH=$_np; export PATH
+    ;;
+esac
 
 usage()
 {

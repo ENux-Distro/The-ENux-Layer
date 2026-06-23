@@ -59,6 +59,41 @@ bind_if_needed /sys "$root/sys"
 bind_if_needed /dev "$root/dev"
 bind_if_needed /dev/pts "$root/dev/pts"
 
+# Share the host's X11 socket so GUI programs in the layer can reach a
+# running display (cross-layer apps). Harmless when no X server is up.
+# /dev/dri and /dev/input come in via the /dev bind above.
+if [ -d /tmp/.X11-unix ]; then
+    mkdir -p "$root/tmp/.X11-unix"
+    bind_if_needed /tmp/.X11-unix "$root/tmp/.X11-unix"
+fi
+
+# Share udev's runtime database. X's libinput driver finds input devices
+# and reads their ID_INPUT_* tags from /run/udev/data, not from /dev - so
+# without this the mouse and keyboard are dead in a layer's X session even
+# though /dev/input is present.
+if [ -d /run/udev ]; then
+    mkdir -p "$root/run/udev"
+    bind_if_needed /run/udev "$root/run/udev"
+fi
+
+# Global view (ENUX_SHARE_GLOBAL=1): share the base system's user data and
+# runtime into the layer so a desktop session run from the layer operates
+# on the real ENux home, drives, processes, and system bus rather than the
+# layer's isolated copies. The layer keeps its own OS dirs (/usr, /lib,
+# /etc, /bin, /sbin, /var) - that is where its binaries, their loadable
+# modules, and config live, so X stays Debian's while "/" is ENux's where
+# it matters to the user. Each dir is shared only if it exists on the base.
+# /root is deliberately NOT shared: a desktop started with `startx` reads
+# its session config (~/.xinitrc) from the layer's /root, so replacing it
+# with the base's would break session launch. User data lives in /home.
+if [ "${ENUX_SHARE_GLOBAL:-0}" = 1 ]; then
+    for gd in home mnt media opt srv run/dbus run/user; do
+        [ -e "/$gd" ] || continue
+        mkdir -p "$root/$gd"
+        bind_if_needed "/$gd" "$root/$gd"
+    done
+fi
+
 # DNS: copy a real resolv.conf into the layer for the chroot session.
 # Many distros ship /etc/resolv.conf as a symlink (Fedora -> /run/systemd/
 # resolve/stub-resolv.conf). If we don't remove that first, cp follows the

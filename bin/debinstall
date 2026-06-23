@@ -1,0 +1,121 @@
+#!/bin/sh
+# debinstall - install Debian packages onto the ENux base root by extracting
+# their .debs and running their maintainer scripts. apt-style, but the
+# install target is "/" (the base), not a layer.
+#
+#   debinstall <package> [package...]
+#
+# The Debian layer's apt is used only to resolve the dependency closure (it
+# knows the graph and mirrors); the .debs are then fetched and extracted
+# onto the base and configured there. Debian's binaries link against the
+# base's glibc, which works because the ENux base ships a newer glibc than
+# Debian.
+#
+# SAFETY: packages in $PROTECTED are part of the closure but are NEVER
+# extracted - they are the base's own toolchain/identity (glibc, gcc
+# runtime, coreutils, shell, dpkg, base-files...). Overwriting the
+# source-built LFS toolchain with Debian's can render the base unbootable.
+
+set -eu
+
+TARGET="${DEBINSTALL_TARGET:-/}"
+LAYER="${DEBINSTALL_LAYER:-/enux/layer/debian}"
+LIBEXEC_DIR="${LIBEXEC_DIR:-/enux/libexec}"
+MULTIARCH=x86_64-linux-gnu
+
+# Base-provided essentials: resolved as deps, but never written to the base.
+PROTECTED="libc6 libc-bin libc-l10n locales libgcc-s1 libstdc++6 gcc-14-base
+ zlib1g base-files base-passwd coreutils bash dash sed grep gawk mawk tar gzip
+ bzip2 xz-utils findutils diffutils util-linux mount bsdutils login passwd
+ dpkg debianutils init-system-helpers sysvinit-utils libselinux1 libpcre2-8-0"
+
+[ "$#" -ge 1 ] || { echo "usage: debinstall <package> [package...]" >&2; exit 2; }
+[ -d "$LAYER" ] || { echo "debinstall: Debian layer not found at $LAYER" >&2; exit 1; }
+
+is_protected() { for p in $PROTECTED; do [ "$1" = "$p" ] && return 0; done; return 1; }
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+cache="$LAYER/var/cache/apt/archives"
+
+# --- 1. Resolve the closure and make sure every .deb is in the cache ------
+# status=/dev/null makes apt treat the layer as empty so the closure is
+# COMPLETE (the layer's own Debian base would otherwise hide those deps).
+#   -d : download any missing .debs into the layer's apt cache
+#   -s : simulate, to list the closure's package names. Names come from -s
+#        (not --print-uris) because --print-uris omits already-cached files.
+echo "debinstall: resolving dependencies for: $*"
+"$LIBEXEC_DIR/layer-enter" debian /usr/bin/apt-get install -y -d \
+    -o Dir::State::status=/dev/null --no-install-recommends "$@" >/dev/null 2>&1 || true
+"$LIBEXEC_DIR/layer-enter" debian /usr/bin/apt-get install -s -y \
+    -o Dir::State::status=/dev/null --no-install-recommends "$@" 2>/dev/null \
+    | sed -n 's/^Inst \([^ ]*\) .*/\1/p' > "$work/names"
+"$LIBEXEC_DIR/layer-disable" debian >/dev/null 2>&1 || true
+
+total=$(wc -l < "$work/names" | tr -d ' ')
+[ "$total" -gt 0 ] || { echo "debinstall: empty closure" >&2; exit 1; }
+echo "debinstall: $total packages in closure"
+
+# --- 2. Collect each closure package's .deb from the cache (skip protected)
+mkdir -p "$work/debs"
+missing=0
+while read -r pkg; do
+    [ -n "$pkg" ] || continue
+    is_protected "$pkg" && continue
+    # shellcheck disable=SC2012  # deb filenames are well-formed; glob+sort -V is fine
+    f=$(ls "$cache/${pkg}_"*.deb 2>/dev/null | sort -V | tail -n1)
+    if [ -n "$f" ] && [ -f "$f" ]; then
+        sudo cp "$f" "$work/debs/"
+    else
+        echo "  ! no cached .deb for $pkg" >&2
+        missing=$((missing + 1))
+    fi
+done < "$work/names"
+[ "$missing" -eq 0 ] || echo "debinstall: warning: $missing packages missing a .deb" >&2
+
+# --- 3. Extract each .deb onto the target (skip protected) ----------------
+mkdir -p "$work/scripts"
+extracted=0; skipped=0
+for f in "$work"/debs/*.deb; do
+    [ -f "$f" ] || continue
+    pkg=$(basename "$f"); pkg=${pkg%%_*}
+    if is_protected "$pkg"; then skipped=$((skipped+1)); continue; fi
+    d="$work/x/$pkg"; mkdir -p "$d"
+    ( cd "$d" && ar x "$f" )
+    sudo tar -xf "$d"/data.tar.* -C "$TARGET" 2>/dev/null
+    mkdir -p "$work/scripts/$pkg"
+    tar -xf "$d"/control.tar.* -C "$work/scripts/$pkg" ./postinst 2>/dev/null || true
+    extracted=$((extracted+1))
+done
+echo "debinstall: extracted $extracted packages, skipped $skipped base-provided"
+
+# --- 4. Make the Debian multiarch libdir searchable, refresh linker cache -
+sudo mkdir -p "$TARGET/etc/ld.so.conf.d"
+printf '/usr/lib/%s\n/lib/%s\n' "$MULTIARCH" "$MULTIARCH" \
+    | sudo tee "$TARGET/etc/ld.so.conf.d/enux-multiarch.conf" >/dev/null
+sudo chroot "$TARGET" /sbin/ldconfig 2>/dev/null || true
+
+# --- 5. Run maintainer scripts (configure), best-effort -------------------
+# A dpkg-less base can't run triggers/update-alternatives, so failures are
+# expected; the key caches are rebuilt explicitly afterward.
+echo "debinstall: running maintainer scripts (best-effort)"
+for pkgdir in "$work"/scripts/*/; do
+    [ -d "$pkgdir" ] && [ -f "$pkgdir/postinst" ] || continue
+    sudo cp "$pkgdir/postinst" "$TARGET/tmp/.debinstall-postinst"
+    sudo chmod 755 "$TARGET/tmp/.debinstall-postinst"
+    sudo chroot "$TARGET" /tmp/.debinstall-postinst configure "" >/dev/null 2>&1 || true
+done
+sudo rm -f "$TARGET/tmp/.debinstall-postinst"
+
+# --- 6. Rebuild the desktop caches the triggers would have built ----------
+echo "debinstall: rebuilding caches"
+sudo chroot "$TARGET" sh -c '
+    command -v glib-compile-schemas >/dev/null 2>&1 && glib-compile-schemas /usr/share/glib-2.0/schemas >/dev/null 2>&1
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database /usr/share/applications >/dev/null 2>&1
+    command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1
+    command -v fc-cache >/dev/null 2>&1 && fc-cache -f >/dev/null 2>&1
+    true
+' 2>/dev/null || true
+
+echo "debinstall: done. Installed onto $TARGET"

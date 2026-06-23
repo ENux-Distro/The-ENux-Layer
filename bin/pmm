@@ -79,14 +79,14 @@ pm_command()
     dnf:search)       echo "dnf search" ;;
     dnf:list)         echo "dnf list --installed" ;;
 
-    apk:install)      echo "apk add" ;;
+    apk:install)      echo "apk add -U" ;;  # -U: refresh index first (like pacman -Sy)
     apk:remove)       echo "apk del" ;;
     apk:update)       echo "apk update" ;;
     apk:upgrade)      echo "apk upgrade" ;;
     apk:search)       echo "apk search" ;;
     apk:list)         echo "apk info" ;;
 
-    xbps-install:install)  echo "xbps-install -y" ;;
+    xbps-install:install)  echo "xbps-install -Sy" ;;  # -S syncs the repo index first
     xbps-install:remove)   echo "xbps-remove -y" ;;
     xbps-install:update)   echo "xbps-install -S" ;;
     xbps-install:upgrade)  echo "xbps-install -Su" ;;
@@ -129,26 +129,84 @@ layer:*)
     ;;
 esac
 
-# Fall back to the first layer in exec_order (read straight from the conf
-# file - the same first-in-order layer `enux exec` would dispatch to).
-if [ -z "$layer" ]; then
-    layer=$(awk -F'=' '/^[ \t]*exec_order/ {gsub(/[ \t]/,"",$2); split($2,a,","); print a[1]; exit}' \
-        "${ENUX_CONF:-/enux/etc/enux.conf}" 2>/dev/null)
-fi
-
-[ -n "$layer" ] || { echo "pmm: no target layer (set one with layer:<name> or enux set-exec-order)" >&2; exit 1; }
-
-root="$LAYER_DIR/$layer"
-[ -d "$root" ] || { echo "pmm: layer '$layer' is not installed" >&2; exit 1; }
-
-pm=$(detect_pm "$root") || {
-    echo "pmm: no supported package manager found in layer '$layer'" >&2
-    exit 1
+# List installed layer names (directories under LAYER_DIR).
+installed_layers()
+{
+    for d in "$LAYER_DIR"/*/; do
+        [ -d "$d" ] && basename "$d"
+    done
 }
 
-cmd=$(pm_command "$pm" "$op")
-[ -n "$cmd" ] || { echo "pmm: '$op' is not supported for $pm" >&2; exit 1; }
+# command -v equivalent for a layer: does it provide this command? Checked
+# by looking at the layer's bin dirs directly - no chroot needed.
+layer_has_cmd()
+{
+    for _d in usr/bin bin usr/sbin sbin usr/local/bin usr/local/sbin; do
+        [ -e "$LAYER_DIR/$1/$_d/$2" ] && return 0
+    done
+    return 1
+}
 
-echo "pmm: [$layer/$pm] $cmd $*"
-# shellcheck disable=SC2086  # $cmd is an intentional multi-word command
-exec "$BIN_DIR/layer" enter "$layer" $cmd "$@"
+# First installed layer in exec_order priority (the base, e.g. enux, has no
+# dir and is skipped); else the first layer dir present.
+default_layer()
+{
+    _conf="${ENUX_CONF:-/enux/etc/enux.conf}"
+    # Word-splitting is intended: layer names from exec_order, space-separated.
+    # shellcheck disable=SC2013
+    for _c in $(awk -F'=' '/^[ \t]*exec_order/ {gsub(/[ \t]/,"",$2); gsub(/,/," ",$2); print $2; exit}' "$_conf" 2>/dev/null); do
+        [ -d "$LAYER_DIR/$_c" ] && { echo "$_c"; return 0; }
+    done
+    installed_layers | head -n1
+}
+
+# Run op in one layer with the given packages; returns the PM's exit status.
+run_in_layer()
+{
+    _layer="$1"; shift
+    [ -d "$LAYER_DIR/$_layer" ] || { echo "pmm: layer '$_layer' is not installed" >&2; return 1; }
+    _pm=$(detect_pm "$LAYER_DIR/$_layer") || {
+        echo "pmm: no supported package manager in layer '$_layer'" >&2
+        return 1
+    }
+    _cmd=$(pm_command "$_pm" "$op")
+    [ -n "$_cmd" ] || { echo "pmm: '$op' not supported for $_pm" >&2; return 1; }
+    echo "pmm: [$_layer/$_pm] $_cmd $*"
+    # shellcheck disable=SC2086  # $_cmd is an intentional multi-word command
+    "$BIN_DIR/layer" enter "$_layer" $_cmd "$@"
+}
+
+rc=0
+mutated=0
+
+if [ -n "$layer" ]; then
+    # Explicit target: operate only on that layer.
+    if run_in_layer "$layer" "$@"; then :; else rc=$?; fi
+    case "$op" in install|remove|upgrade) mutated=1 ;; esac
+elif [ "$op" = remove ]; then
+    # No explicit target: remove from EVERY layer that has the command, so
+    # `pmm remove X` actually makes X gone rather than from just one layer.
+    found=0
+    for l in $(installed_layers); do
+        present=""
+        for pkg in "$@"; do
+            layer_has_cmd "$l" "$pkg" && present="$present $pkg"
+        done
+        [ -n "$present" ] || continue
+        found=1; mutated=1
+        # shellcheck disable=SC2086  # $present is an intentional word list
+        if run_in_layer "$l" $present; then :; else rc=$?; fi
+    done
+    [ "$found" = 1 ] || { echo "pmm: '$*' not found in any layer" >&2; exit 1; }
+else
+    # No explicit target: default to the first installed layer.
+    target=$(default_layer)
+    [ -n "$target" ] || { echo "pmm: no installed layer to target (use layer:<name>)" >&2; exit 1; }
+    if run_in_layer "$target" "$@"; then :; else rc=$?; fi
+    case "$op" in install|upgrade) mutated=1 ;; esac
+fi
+
+# install/remove/upgrade change which commands layers provide -> refresh
+# the cross wrappers once afterward.
+[ "$mutated" = 1 ] && { "$BIN_DIR/enux" cross >/dev/null 2>&1 || true; }
+exit "$rc"

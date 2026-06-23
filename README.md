@@ -1,10 +1,10 @@
 # The ENux Layer
 
 The ENux Layer lets multiple Linux distributions coexist on one system and
-share a unified package-management front-end. It is the core of the
-ENux 6.x lineup — heavily inspired by [Bedrock Linux](https://bedrocklinux.org),
+share a unified package-management front end. It is the core of the
+ENux 6.x lineup — inspired by [Bedrock Linux](https://bedrocklinux.org),
 but reimplemented from scratch so ENux carries no upstream dependency, and
-designed from day one to work in chroot, container, and non-PID-1
+designed from the start to work in chroot, container, and non-PID-1
 environments (live ISOs included).
 
 A *layer* is a distribution's root filesystem under `/enux/layer/<name>`.
@@ -14,54 +14,77 @@ consistent set of commands, regardless of which distro each layer runs.
 ## Layout
 
 ```
-/enux/bin/enux        layer lifecycle manager (install/remove/list/...)
-/enux/bin/layer       enable/disable/enter a layer (the strat clone)
-/enux/bin/pmm         unified package manager front-end
-/enux/libexec/        mount/chroot mechanics behind `layer`
-/enux/sbin/init       init.c — PID 1 (built separately; see Building)
-/enux/etc/enux.conf   configuration (init + layer settings)
-/enux/layer/<name>/   installed layer rootfilesystems
+/enux/bin/          enux, layer, pmm, debinstall        (user commands)
+/enux/libexec/      layer-enable, layer-disable,
+                    layer-enter, cross-dispatch          (mechanics)
+/enux/sbin/init     init.c — PID 1 (built separately; see Building)
+/enux/cross/        cross-command dir (per-command symlinks + index)
+/enux/etc/          enux.conf, os-release, enux.sh
+/enux/layer/<name>/ installed layer rootfilesystems
 ```
 
 ## Commands
 
 ### `enux` — manage layers
 
-```sh
-enux install <name> [url-or-tarball]   # fetch + install a layer
-enux remove <name>                     # disable and delete a layer
-enux list                              # list installed layers
-enux show <name>                       # details for one layer
-enux set-exec-order <name> [name...]   # set priority order
-enux exec <command> [args...]          # run in the first layer in order
+```
+enux install <name> [url-or-tarball]   fetch + install a layer
+enux remove <name>                     disable and delete a layer
+enux list                              list installed layers
+enux show <name>                       details for one layer
+enux set-exec-order <name> [name...]   set priority order
+enux exec <command> [args...]          run in the first layer in order
+enux cross                             rebuild the cross-command dir
+enux configure <name>                  (re)set up a layer's repos/keys
 ```
 
-Known layers (`arch`, `alpine`, `fedora`, and other linuxcontainers
-distros: `debian`, `ubuntu`, `rockylinux`, `centos`, `opensuse`,
-`voidlinux`) have a built-in rootfs source — `enux install fedora` just
-works. Rootfs resolution prefers a mirror's `latest` alias when one
-exists, otherwise it grabs the newest uploaded tarball.
+Known layers have a built-in rootfs source, so `enux install fedora` just
+works: `arch`, `alpine`, `fedora`, `debian`, `ubuntu`, `opensuse`, `void`,
+`gentoo`, `rockylinux`, `centos`. Rootfs resolution prefers a mirror's
+`latest` alias when one exists, otherwise the newest upload.
 
-### `layer` — enter a layer
+On install, each layer is also configured for immediate use (Arch keyring +
+mirrorlist, Alpine/Debian/openSUSE repos), and the ENux tooling
+(`/enux/bin`, `/enux/cross`, `/enux/libexec`) is copied into it with its
+`/etc/profile` extended so the commands are on `PATH` inside the layer.
 
-```sh
-layer enable <name>                    # mount the layer for use
-layer enter <name> [command [args]]    # enable + chroot in (shell if no cmd)
-layer disable <name>                   # tear the layer's mounts down
-layer list                             # show layers and mount state
+### `layer` — enter a layer (the strat clone)
+
 ```
+layer enable <name>                    mount the layer for use
+layer disable <name>                   tear the layer's mounts down
+layer enter [--global] <name> [cmd]    enable + chroot in (shell if no cmd)
+layer list                             show layers and mount state
+```
+
+`layer-enable` self-binds the layer, brings in `/proc`, `/sys`, `/dev`, the
+X11 socket and udev runtime, and (with `--global`) shares the base system's
+`/home`, drives, and runtime so a layer's desktop operates on the real ENux
+root.
 
 ### `pmm` — packages, any distro
 
-```sh
-pmm install <pkg...>                   # into the default (first) layer
-pmm install layer:<name> <pkg...>      # into a specific layer
+```
+pmm install <pkg...>                   into the default (first) layer
+pmm install layer:<name> <pkg...>      into a specific layer
 pmm remove|update|upgrade|search|list ...
 ```
 
 `pmm` detects each layer's native package manager (pacman, apt, dnf, apk,
 xbps, zypper, emerge) and translates the operation, so the same command
-works everywhere.
+works everywhere. `pmm remove <pkg>` removes it from every layer that has
+it.
+
+### `debinstall` — Debian packages onto a target root
+
+```
+debinstall <package> [package...]
+```
+
+Resolves a Debian package's dependency closure via the Debian layer's apt,
+then extracts the `.debs` and runs their maintainer scripts onto a target
+root (default `/`), skipping the base's own toolchain. Niche tool; the
+layer + `pmm` workflow is the normal path.
 
 ## Building
 
@@ -72,6 +95,7 @@ component (`sbin/init`) is the static binary from the separate
 ```sh
 make INIT_SRC=/path/to/init.c     # builds init, places it in sbin/init
 make check                        # syntax-check the shell scripts
+make install DESTDIR="$ROOT"      # lay /enux into a rootfs
 ```
 
 `INIT_SRC` defaults to `../init.c`. The tooling is fully usable without
@@ -80,17 +104,16 @@ enablement.
 
 ## Putting it in an ISO
 
-```sh
-make install DESTDIR="$ROOTFS"    # lay /enux into your ISO rootfs
-```
-
-See [ISO.md](ISO.md) for the full procedure, including the mandatory step
-of disabling every layer before running `mksquashfs` — enabled layers
+See [ISO.md](ISO.md) for the full live-ISO procedure, including the
+mandatory step of disabling every layer before `mksquashfs` (enabled layers
 bind-mount the host's live `/proc` and `/dev`, which must never be baked
-into an image.
+into an image).
 
 ## Status
 
-Early alpha. The commands (`enux`, `layer`, `pmm`) work and are tested on
-read-only squashfs roots. Boot-time automatic layer enablement via init.c
-is not yet wired — see [ISO.md](ISO.md).
+Early alpha. The commands work and are tested on read-only squashfs roots
+and in a booted live ISO. See [CONTRIBUTING.md](CONTRIBUTING.md) to help.
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).

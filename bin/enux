@@ -18,7 +18,26 @@ set -eu
 
 BIN_DIR="${BIN_DIR:-/enux/bin}"
 LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+LIBEXEC_DIR="${LIBEXEC_DIR:-/enux/libexec}"
+CROSS_DIR="${CROSS_DIR:-/enux/cross}"
 ENUX_CONF="${ENUX_CONF:-/enux/etc/enux.conf}"
+
+# Strip the cross dir from our own PATH. cross wrappers run a command
+# inside a layer's chroot; if enux's helpers (curl/wget/tar) resolved to a
+# wrapper, they would execute in that chroot and fail on base paths - e.g.
+# downloading to a base /tmp dir that does not exist inside the layer.
+# Base tooling must use the base system's real binaries.
+case ":$PATH:" in
+*":$CROSS_DIR/bin:"*)
+    _np=""; _oifs=$IFS; IFS=:
+    for _p in $PATH; do
+        [ "$_p" = "$CROSS_DIR/bin" ] && continue
+        _np="${_np:+$_np:}$_p"
+    done
+    IFS=$_oifs
+    PATH=$_np; export PATH
+    ;;
+esac
 
 usage()
 {
@@ -29,8 +48,52 @@ usage: enux install <name> [url-or-tarball-path]
        enux show <name>
        enux set-exec-order <name> [name...]
        enux exec <command> [args...]
+       enux cross
+       enux configure <name>
 EOF
     exit 2
+}
+
+# --- HTTP helpers ----------------------------------------------------
+#
+# Prefer curl, fall back to wget. Minimal targets (LFS, some containers)
+# often ship only one of the two; The ENux Layer must work on either.
+
+# Set ENUX_FETCH_INSECURE=1 to skip TLS certificate verification. Needed
+# only on systems without a CA bundle (a bare LFS lacks ca-certificates);
+# the real fix is to install ca-certificates. Default is to verify.
+if [ "${ENUX_FETCH_INSECURE:-0}" = 1 ]; then
+    CURL_TLS="-k"
+    WGET_TLS="--no-check-certificate"
+else
+    CURL_TLS=""
+    WGET_TLS=""
+fi
+
+# Fetch a URL to stdout, failing on HTTP errors.
+http_get()
+{
+    if command -v curl >/dev/null 2>&1; then
+        curl $CURL_TLS -sfL "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget $WGET_TLS -qO- "$1"
+    else
+        echo "enux: need curl or wget to fetch $1" >&2
+        return 1
+    fi
+}
+
+# Download a URL ($1) to a file ($2), failing on HTTP errors.
+http_download()
+{
+    if command -v curl >/dev/null 2>&1; then
+        curl $CURL_TLS -fL -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget $WGET_TLS -O "$2" "$1"
+    else
+        echo "enux: need curl or wget to download $1" >&2
+        return 1
+    fi
 }
 
 # --- enux.conf [layers] section helpers ------------------------------
@@ -140,7 +203,7 @@ exec_order_remove()
 lxc_latest_release()
 {
     distro="$1"
-    curl -sfL "https://images.linuxcontainers.org/images/$distro/" \
+    http_get "https://images.linuxcontainers.org/images/$distro/" \
         | grep -oE 'href="[^"/]+/"' \
         | sed 's/href="//; s|/"||' \
         | grep -vE '^\.\.$' \
@@ -149,6 +212,8 @@ lxc_latest_release()
 }
 
 # Resolve a downloadable rootfs.tar.xz under a linuxcontainers image dir.
+# Args: <distro> <release> [variant]  (variant defaults to "default";
+# gentoo has no "default" and uses openrc/systemd instead).
 # Honors the rule: prefer an explicit "latest" alias if the mirror has
 # one, otherwise pick the newest timestamped upload. Timestamp dirs look
 # like 20260622_02%3A12/ (the %3A is a URL-encoded colon).
@@ -156,8 +221,10 @@ lxc_rootfs_url()
 {
     distro="$1"
     release="$2"
-    base="https://images.linuxcontainers.org/images/$distro/$release/amd64/default"
-    listing=$(curl -sfL "$base/") || return 1
+    variant="${3:-default}"
+    [ -n "$release" ] || return 1
+    base="https://images.linuxcontainers.org/images/$distro/$release/amd64/$variant"
+    listing=$(http_get "$base/") || return 1
 
     if echo "$listing" | grep -q 'href="latest/"'; then
         sub="latest/"
@@ -183,17 +250,44 @@ default_source()
         # Alpine's minirootfs filename is versioned and has no permanent
         # "latest" alias - resolve the current one from the listing.
         base="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64"
-        file=$(curl -sfL "$base/" | grep -oE 'alpine-minirootfs-[0-9.]+-x86_64\.tar\.gz' | head -n1)
+        file=$(http_get "$base/" | grep -oE 'alpine-minirootfs-[0-9.]+-x86_64\.tar\.gz' | head -n1)
         [ -n "$file" ] && echo "$base/$file"
         ;;
-    fedora|debian|ubuntu|rockylinux|centos|opensuse|voidlinux)
-        # All served by linuxcontainers with the same layout.
-        release=$(lxc_latest_release "$1")
-        [ -n "$release" ] && lxc_rootfs_url "$1" "$release"
+    # linuxcontainers-served distros. Numeric-release ones (fedora, rocky,
+    # centos) auto-detect the newest; the rest use codenames or "current"
+    # that sort -V can't rank, so their release is pinned to a sensible
+    # default. The third arg is the image variant (gentoo has no
+    # "default"). Friendly layer names map to linuxcontainers identifiers
+    # (void -> voidlinux).
+    fedora|rockylinux|centos)
+        lxc_rootfs_url "$1" "$(lxc_latest_release "$1")" default
+        ;;
+    debian)
+        lxc_rootfs_url debian trixie default
+        ;;
+    ubuntu)
+        lxc_rootfs_url ubuntu noble default
+        ;;
+    opensuse)
+        lxc_rootfs_url opensuse 16.0 default
+        ;;
+    void)
+        lxc_rootfs_url voidlinux current default
+        ;;
+    gentoo)
+        lxc_rootfs_url gentoo current openrc
         ;;
     *)
         ;;
     esac
+}
+
+# A directory looks like a root filesystem if it has /etc and either a
+# /usr or a /bin. Used to locate the real rootfs inside an extracted
+# tarball, whatever wrapping the distro uses.
+is_rootfs()
+{
+    [ -d "$1/etc" ] && { [ -d "$1/usr" ] || [ -d "$1/bin" ]; }
 }
 
 fetch_and_extract()
@@ -202,6 +296,11 @@ fetch_and_extract()
     dest="$2"
     work="$(mktemp -d)"
     trap 'rm -rf "$work"' EXIT
+
+    # Extract into a clean subdir so the downloaded archive never ends up
+    # mixed in with (and mistaken for) the extracted contents.
+    xdir="$work/extract"
+    mkdir -p "$xdir"
 
     case "$src" in
     *.tar.zst) ext=tar.zst ;;
@@ -212,8 +311,8 @@ fetch_and_extract()
 
     case "$src" in
     http://*|https://*)
-        archive="$work/rootfs.$ext"
-        curl -fL -o "$archive" "$src"
+        archive="$work/download.$ext"     # sits outside $xdir
+        http_download "$src" "$archive"
         ;;
     *)
         [ -f "$src" ] || { echo "enux: no such file: $src" >&2; exit 1; }
@@ -222,28 +321,214 @@ fetch_and_extract()
     esac
 
     case "$archive" in
-    *.tar.zst) tar --use-compress-program=unzstd -xf "$archive" -C "$work" ;;
-    *.tar.xz)  tar -xJf "$archive" -C "$work" ;;
-    *.tar.gz|*.tgz) tar -xzf "$archive" -C "$work" ;;
+    *.tar.zst) tar --use-compress-program=unzstd -xf "$archive" -C "$xdir" ;;
+    *.tar.xz)  tar -xJf "$archive" -C "$xdir" ;;
+    *.tar.gz|*.tgz) tar -xzf "$archive" -C "$xdir" ;;
     *) echo "enux: unrecognized archive format: $archive" >&2; exit 1 ;;
     esac
 
-    # Bootstrap tarballs vary on whether they wrap contents in one
-    # top-level dir (root.x86_64/) or not (alpine minirootfs doesn't).
-    entries=$(find "$work" -mindepth 1 -maxdepth 1 ! -name 'rootfs.tar')
-    count=$(echo "$entries" | grep -c .)
-    if [ "$count" -eq 1 ] && [ -d "$entries" ]; then
-        srcdir="$entries"
+    # Find the actual rootfs. Some tarballs are a flat rootfs (alpine
+    # minirootfs, linuxcontainers rootfs.tar.xz); Arch's bootstrap wraps
+    # it in root.x86_64/ next to pkglist/version metadata files.
+    rootfs=""
+    if is_rootfs "$xdir"; then
+        rootfs="$xdir"
     else
-        srcdir="$work"
+        for d in "$xdir"/*/; do
+            [ -d "$d" ] || continue
+            if is_rootfs "$d"; then
+                rootfs="${d%/}"
+                break
+            fi
+        done
     fi
+    [ -n "$rootfs" ] || {
+        echo "enux: no root filesystem found in $src" >&2
+        exit 1
+    }
 
-    mv "$srcdir" "$dest.movetmp"
+    mkdir -p "$(dirname "$dest")"
+    mv "$rootfs" "$dest.movetmp"
     rmdir "$dest" 2>/dev/null || true
     mv "$dest.movetmp" "$dest"
 }
 
+# --- per-distro post-install configuration ---------------------------
+
+# Set up a freshly installed layer's package repositories (and signing
+# keys) so its package manager works immediately. Bootstrap rootfses ship
+# without usable repo config: Arch's mirrorlist is all-commented and its
+# keyring is empty; Alpine's minirootfs has no repositories file. Runs in
+# a subshell so its variables don't leak into the caller.
+configure_layer()
+(
+    name="$1"
+    dest="$LAYER_DIR/$name"
+
+    case "$name" in
+    arch)
+        # $repo/$arch must stay literal - pacman expands them, not us.
+        # shellcheck disable=SC2016
+        echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' \
+            > "$dest/etc/pacman.d/mirrorlist"
+        # pacman-key must run inside the layer (it writes the layer's
+        # keyring and uses its gpg). Slow but needed for signed installs.
+        echo "enux: initializing pacman keyring for arch (takes a moment)..."
+        if "$BIN_DIR/layer" enter arch /bin/sh -c \
+              'pacman-key --init && pacman-key --populate archlinux' \
+              >/dev/null 2>&1; then
+            "$BIN_DIR/layer" disable arch >/dev/null 2>&1 || true
+        else
+            "$BIN_DIR/layer" disable arch >/dev/null 2>&1 || true
+            echo "enux: warning: pacman keyring init failed; run" \
+                 "'layer enter arch pacman-key --init && ... --populate archlinux'" >&2
+        fi
+        ;;
+    alpine)
+        # Derive the release (e.g. 3.24) from the rootfs and point apk at
+        # the matching main + community repositories.
+        ver=$(cut -d. -f1,2 "$dest/etc/alpine-release" 2>/dev/null || true)
+        if [ -n "$ver" ]; then
+            {
+                echo "https://dl-cdn.alpinelinux.org/alpine/v$ver/main"
+                echo "https://dl-cdn.alpinelinux.org/alpine/v$ver/community"
+            } > "$dest/etc/apk/repositories"
+        fi
+        ;;
+    debian|ubuntu)
+        # apt won't install anything until the package lists are fetched
+        # once, and apt-get install has no combined sync flag. Prime them.
+        echo "enux: updating apt package lists for $name..."
+        "$BIN_DIR/layer" enter "$name" /bin/sh -c 'apt-get update' \
+            >/dev/null 2>&1 || \
+            echo "enux: warning: apt-get update failed; run it before installing" >&2
+        "$BIN_DIR/layer" disable "$name" >/dev/null 2>&1 || true
+        ;;
+    opensuse)
+        # Refresh zypper repos so the first install doesn't stall on it.
+        "$BIN_DIR/layer" enter "$name" /bin/sh -c \
+            'zypper --non-interactive --gpg-auto-import-keys refresh' \
+            >/dev/null 2>&1 || true
+        "$BIN_DIR/layer" disable "$name" >/dev/null 2>&1 || true
+        ;;
+    gentoo)
+        # emerge needs a portage tree, which the stage image does not
+        # include. Syncing it is large/slow, so it is left to the user.
+        echo "enux: note - gentoo needs a portage tree before emerge works:" \
+             "run 'layer enter gentoo emerge-webrsync' (large download)" >&2
+        ;;
+    *)
+        # fedora/void and other linuxcontainers images ship working repo config.
+        ;;
+    esac
+)
+
+# --- cross commands --------------------------------------------------
+
+# (Re)build /enux/cross/bin: one symlink per command found in the
+# non-base layers, pointing at cross-dispatch, plus an index mapping each
+# command to the layer that provides it. exec_order decides priority -
+# the first layer to claim a command name wins.
+# Body runs in a subshell ( ) so its working variables (name, layer, ...)
+# never leak into callers like cmd_install, which has its own $name.
+cross_update()
+(
+    bindir="$CROSS_DIR/bin"
+    index="$CROSS_DIR/index"
+    dispatch="$LIBEXEC_DIR/cross-dispatch"
+
+    if [ ! -x "$dispatch" ]; then
+        echo "enux: $dispatch missing; cannot build cross commands" >&2
+        exit 1
+    fi
+
+    rm -rf "$bindir"
+    mkdir -p "$bindir"
+    : > "$index"
+
+    # Base root that owns this cross dir: /enux/cross -> "" (i.e. /), or
+    # /mnt/lfs2/enux/cross -> /mnt/lfs2. Commands the base already provides
+    # are skipped, so coreutils (basename, ls, sh...) are never wrapped -
+    # only distro-unique tools (pacman, apk, dnf...) get crossed. This also
+    # removes any chance of cross-dispatch recursing through a wrapped
+    # coreutil.
+    base_root="${CROSS_DIR%/enux/cross}"
+    [ "$base_root" = "$CROSS_DIR" ] && base_root=""
+
+    base_has()
+    {
+        for _bd in usr/bin bin usr/sbin sbin; do
+            [ -e "$base_root/$_bd/$1" ] && return 0
+        done
+        return 1
+    }
+
+    # Cross every installed layer. exec_order sets priority for command
+    # name conflicts; any installed layer not in exec_order is appended.
+    # The base layer (e.g. enux) has no dir under /enux/layer, so it is
+    # naturally excluded - its commands are already native on PATH.
+    ordered=""
+    for l in $(exec_order_list); do
+        [ -d "$LAYER_DIR/$l" ] || continue
+        ordered="$ordered $l"
+    done
+    for d in "$LAYER_DIR"/*/; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        case " $ordered " in *" $name "*) ;; *) ordered="$ordered $name" ;; esac
+    done
+
+    for layer in $ordered; do
+        root="$LAYER_DIR/$layer"
+        [ -d "$root" ] || continue
+        for d in usr/bin bin usr/sbin sbin; do
+            [ -d "$root/$d" ] || continue
+            for f in "$root/$d"/*; do
+                [ -f "$f" ] && [ -x "$f" ] || continue
+                cmd=$(basename "$f")
+                base_has "$cmd" && continue                  # base provides it
+                grep -q "^$cmd " "$index" 2>/dev/null && continue
+                # Record the command's absolute path *inside* the layer so
+                # the dispatcher can exec it directly under chroot, instead
+                # of relying on PATH resolution (Alpine's apk is in /sbin,
+                # which the caller's PATH may not include).
+                echo "$cmd $layer /$d/$cmd" >> "$index"
+                ln -sf "$dispatch" "$bindir/$cmd"
+            done
+        done
+    done
+    echo "enux: cross commands updated ($(wc -l < "$index" | tr -d ' ') commands)"
+)
+
 # --- subcommands -------------------------------------------------------
+
+# Copy the ENux Layer command set, cross dir, and libexec into a layer, so
+# the tooling and cross commands are reachable from inside it. libexec is
+# required: the cross symlinks point at /enux/libexec/cross-dispatch and the
+# bin commands call /enux/libexec/layer-*. cp -a preserves symlinks (the
+# cross dir is hundreds of links) and does NOT dereference them.
+copy_tooling_into_layer()
+{
+    dst="$1"
+    mkdir -p "$dst/enux"
+    rm -rf "$dst/enux/bin" "$dst/enux/cross" "$dst/enux/libexec"
+    cp -a "$BIN_DIR" "$dst/enux/bin"
+    cp -a "$LIBEXEC_DIR" "$dst/enux/libexec"
+    [ -d "$CROSS_DIR" ] && cp -a "$CROSS_DIR" "$dst/enux/cross"
+
+    # Put the ENux tooling + cross commands on PATH. Appended to /etc/profile
+    # (not bash.bashrc): `layer enter` starts /bin/sh -l, a login shell, which
+    # sources /etc/profile - and it works for sh, not just bash. Single-quoted
+    # so $PATH stays literal in the file (expanded at runtime). Idempotent;
+    # appended last so it extends whatever PATH the distro's profile sets.
+    rc="$dst/etc/profile"
+    if ! grep -qF '/enux/cross/bin' "$rc" 2>/dev/null; then
+        mkdir -p "$dst/etc"
+        # $PATH must stay literal in the file (expanded at runtime).
+        # shellcheck disable=SC2016
+        printf '\n# ENux Layer: tooling and cross commands\nexport PATH="$PATH:/enux/bin:/enux/cross/bin"\n' >> "$rc"
+    fi
+}
 
 cmd_install()
 {
@@ -261,6 +546,9 @@ cmd_install()
     echo "enux: fetching $src"
     fetch_and_extract "$src" "$dest"
     exec_order_add "$name"
+    configure_layer "$name"     # set up package repos / keys
+    cross_update || true        # keep cross commands in sync; non-fatal
+    copy_tooling_into_layer "$dest"   # make /enux/bin + /enux/cross available inside it
     echo "enux: '$name' installed at $dest"
 }
 
@@ -277,6 +565,7 @@ cmd_remove()
     "$BIN_DIR/layer" disable "$name"
     rm -rf "$dest"
     exec_order_remove "$name"
+    cross_update || true        # drop the removed layer's cross commands
     echo "enux: '$name' removed"
 }
 
@@ -339,5 +628,7 @@ list)            cmd_list "$@" ;;
 show)             cmd_show "$@" ;;
 set-exec-order)  cmd_set_exec_order "$@" ;;
 exec)            cmd_exec "$@" ;;
+cross)           cross_update ;;
+configure)       [ "$#" -eq 1 ] || usage; [ -d "$LAYER_DIR/$1" ] || { echo "enux: '$1' is not installed" >&2; exit 1; }; configure_layer "$1" ;;
 *)               usage ;;
 esac

@@ -12,8 +12,16 @@ set -eu
 LIBEXEC_DIR="${LIBEXEC_DIR:-/enux/libexec}"
 LAYER_DIR="${LAYER_DIR:-/enux/layer}"
 
+# --global: also share the base system's home/drives/runtime into the
+# layer (see layer-enable), so a desktop session operates on the real
+# ENux root rather than the layer's isolated copies.
+if [ "${1:-}" = "--global" ]; then
+    export ENUX_SHARE_GLOBAL=1
+    shift
+fi
+
 if [ "$#" -lt 1 ]; then
-    echo "usage: layer-enter <name> [command [args...]]" >&2
+    echo "usage: layer-enter [--global] <name> [command [args...]]" >&2
     exit 2
 fi
 
@@ -23,8 +31,14 @@ root="$LAYER_DIR/$name"
 
 "$LIBEXEC_DIR/layer-enable" "$name"
 
+# Give the chrooted command a standard PATH. chroot resolves the command
+# name with the PATH it inherits; the caller's PATH may omit /sbin (where
+# Alpine's apk lives) or /bin, so a bare command name like `apk` would not
+# be found. env applies the PATH for the lookup inside the new root.
+ENTER_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 if [ "$#" -eq 0 ]; then
-    exec chroot "$root" /bin/sh -l
+    exec env PATH="$ENTER_PATH" chroot "$root" /bin/sh -l
 fi
 
-exec chroot "$root" "$@"
+exec env PATH="$ENTER_PATH" chroot "$root" "$@"
