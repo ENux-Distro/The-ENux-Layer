@@ -1,0 +1,106 @@
+#!/bin/sh
+# layer-provision - replicate the host's login user (identity, hardware
+# groups, and locale) into a layer, idempotently. This is what lets
+# `layer enter --global` run a desktop session as the real user instead of
+# root: the user needs a matching passwd entry, group membership for hardware
+# access, and a generated locale inside the layer.
+#
+# Called eagerly by `enux install` and lazily by `layer-enter --global` (so
+# pre-shipped layers, which had no user at ISO-build time, get provisioned on
+# first use). Safe to run repeatedly; a no-op once everything is in place, and
+# a no-op when there is no real user yet (e.g. inside the ISO build chroot).
+#
+# Usage: layer-provision <layer-name>
+
+set -eu
+
+LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+BIN_DIR="${BIN_DIR:-/enux/bin}"
+
+[ "${1:-}" ] || { echo "usage: layer-provision <layer>" >&2; exit 2; }
+name="$1"
+dest="$LAYER_DIR/$name"
+[ -d "$dest" ] || { echo "layer-provision: '$name' is not installed" >&2; exit 1; }
+
+# Target user: whoever invoked us via sudo, else the first real (>=1000)
+# account on the base. None found -> nothing to do (build chroot).
+uid="${SUDO_UID:-}"
+[ -n "$uid" ] || uid=$(awk -F: '$3>=1000 && $3<65534 {print $3; exit}' /etc/passwd)
+[ -n "$uid" ] || exit 0
+
+pent=$(awk -F: -v u="$uid" '$3==u {print; exit}' /etc/passwd)
+[ -n "$pent" ] || exit 0
+uname=$(printf '%s' "$pent" | cut -d: -f1)
+ugid=$(printf '%s' "$pent" | cut -d: -f4)
+
+# --- identity: passwd, primary group, locked shadow (all idempotent) ---
+awk -F: -v n="$uname" '$1==n{f=1} END{exit !f}' "$dest/etc/passwd" 2>/dev/null \
+    || printf '%s\n' "$pent" >> "$dest/etc/passwd"
+
+gname=""
+gent=$(awk -F: -v g="$ugid" '$3==g {print; exit}' /etc/group)
+if [ -n "$gent" ]; then
+    gname=$(printf '%s' "$gent" | cut -d: -f1)
+    awk -F: -v n="$gname" '$1==n{f=1} END{exit !f}' "$dest/etc/group" 2>/dev/null \
+        || printf '%s\n' "$gent" >> "$dest/etc/group"
+fi
+
+if [ -f "$dest/etc/shadow" ]; then
+    awk -F: -v n="$uname" '$1==n{f=1} END{exit !f}' "$dest/etc/shadow" \
+        || printf '%s:!:19000:0:99999:7:::\n' "$uname" >> "$dest/etc/shadow"
+fi
+
+# --- supplementary hardware groups (audio/video/input/render/...) ---
+# Add the user to base groups that also exist in the layer, so the desktop
+# session has device access. The awk rewrite only touches the matching group
+# line and never double-adds, so it is idempotent.
+for grp in $(id -nG "$uname" 2>/dev/null); do
+    [ "$grp" = "$gname" ] && continue
+    if awk -F: -v g="$grp" -v u="$uname" 'BEGIN{OFS=":"}
+        $1==g { has=0; c=split($4,m,","); for(i=1;i<=c;i++) if(m[i]==u) has=1;
+                if(!has) $4=($4==""?u:$4","u) }
+        {print}' "$dest/etc/group" > "$dest/etc/group.enux" 2>/dev/null; then
+        mv "$dest/etc/group.enux" "$dest/etc/group"
+    else
+        rm -f "$dest/etc/group.enux"
+    fi
+done
+
+# --- allow the real user to start X without a logind seat ---
+# `layer enter --user` has no seat, so Xorg.wrap's default
+# allowed_users=console rejects it. Where X is installed, write the permissive
+# wrapper config (idempotent) so startxfce4 can run as the user; needs_root_-
+# rights lets Xorg claim DRM/input without a seat.
+if { [ -e "$dest/usr/bin/Xorg" ] || [ -e "$dest/usr/lib/xorg/Xorg.wrap" ]; } \
+   && ! grep -qs '^allowed_users=anybody' "$dest/etc/X11/Xwrapper.config"; then
+    mkdir -p "$dest/etc/X11"
+    printf 'allowed_users=anybody\nneeds_root_rights=yes\n' > "$dest/etc/X11/Xwrapper.config"
+fi
+
+# --- locale: generate the host's LANG inside the layer (only when needed) ---
+lang=$(awk -F= '/^LANG=/{gsub(/"/,"",$2); print $2; exit}' \
+       /etc/locale.conf /etc/default/locale 2>/dev/null | head -1)
+[ -n "$lang" ] || lang="${LANG:-}"
+case "$lang" in
+    ""|C|C.*|POSIX) exit 0 ;;
+esac
+
+# Already set to this locale? assume generated, skip the expensive locale-gen.
+cur=$(awk -F= '/^LANG=/{gsub(/"/,"",$2); print $2; exit}' \
+      "$dest/etc/locale.conf" 2>/dev/null || true)
+[ "$cur" = "$lang" ] && exit 0
+
+printf 'LANG=%s\n' "$lang" > "$dest/etc/locale.conf" 2>/dev/null || true
+[ -f "$dest/etc/default/locale" ] && printf 'LANG=%s\n' "$lang" > "$dest/etc/default/locale"
+
+base=$(printf '%s' "$lang" | sed 's/ .*//')
+if [ -f "$dest/etc/locale.gen" ]; then
+    sed -i "s/^# *\(${base}[ .].*\)$/\1/" "$dest/etc/locale.gen" 2>/dev/null || true
+    grep -q "^[^#]*${base}" "$dest/etc/locale.gen" 2>/dev/null \
+        || printf '%s UTF-8\n' "$base" >> "$dest/etc/locale.gen"
+fi
+if [ -x "$dest/usr/sbin/locale-gen" ] || [ -x "$dest/usr/bin/locale-gen" ]; then
+    "$BIN_DIR/layer" enter "$name" /bin/sh -c 'locale-gen' >/dev/null 2>&1 || true
+    "$BIN_DIR/layer" disable "$name" >/dev/null 2>&1 || true
+fi
+exit 0

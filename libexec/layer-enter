@@ -12,16 +12,23 @@ set -eu
 LIBEXEC_DIR="${LIBEXEC_DIR:-/enux/libexec}"
 LAYER_DIR="${LAYER_DIR:-/enux/layer}"
 
-# --global: also share the base system's home/drives/runtime into the
-# layer (see layer-enable), so a desktop session operates on the real
-# ENux root rather than the layer's isolated copies.
-if [ "${1:-}" = "--global" ]; then
-    export ENUX_SHARE_GLOBAL=1
-    shift
-fi
+# Flags (any order, before the layer name):
+#   --global  also share the base's home/drives/runtime into the layer (see
+#             layer-enable), so a desktop operates on the real ENux root.
+#   --user    run the command as the invoking real user (uid 1000-style)
+#             instead of root. Root-needing tasks (apt, the NetworkManager
+#             daemon) must NOT use this; a desktop session should.
+ENUX_AS_USER=0
+while :; do
+    case "${1:-}" in
+        --global) export ENUX_SHARE_GLOBAL=1; shift ;;
+        --user)   ENUX_AS_USER=1; shift ;;
+        *)        break ;;
+    esac
+done
 
 if [ "$#" -lt 1 ]; then
-    echo "usage: layer-enter [--global] <name> [command [args...]]" >&2
+    echo "usage: layer-enter [--global] [--user] <name> [command [args...]]" >&2
     exit 2
 fi
 
@@ -31,14 +38,49 @@ root="$LAYER_DIR/$name"
 
 "$LIBEXEC_DIR/layer-enable" "$name"
 
-# Give the chrooted command a standard PATH. chroot resolves the command
-# name with the PATH it inherits; the caller's PATH may omit /sbin (where
-# Alpine's apk lives) or /bin, so a bare command name like `apk` would not
-# be found. env applies the PATH for the lookup inside the new root.
-ENTER_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Give the chrooted command a standard PATH plus the ENux tooling and
+# cross-command dirs. chroot resolves the command name with the PATH it
+# inherits; the caller's may omit /sbin (where Alpine's apk lives), and a
+# command-form enter never sources /etc/profile, so set it here. The
+# standard dirs come first (the layer's own programs win); /enux/bin and
+# /enux/cross/bin are appended so `enux`/`layer`/`pmm` and other strata's
+# commands are reachable without overriding native ones.
+ENTER_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/enux/bin:/enux/cross/bin"
 
-if [ "$#" -eq 0 ]; then
-    exec env PATH="$ENTER_PATH" chroot "$root" /bin/sh -l
+# With --user, run as the invoking real user, not root. Ensure that user
+# exists in the layer (this lazily provisions the pre-shipped layers, which
+# had no user at ISO-build time), then resolve their uid/gid/home so we can
+# drop to them after chroot. Without --user we stay root (apt, NM daemon, etc).
+GUID=""; GGID=""; GHOME=""; GUSER=""
+if [ "$ENUX_AS_USER" = 1 ]; then
+    "$LIBEXEC_DIR/layer-provision" "$name" >/dev/null 2>&1 || true
+    GUID="${SUDO_UID:-}"
+    [ -n "$GUID" ] || GUID=$(awk -F: '$3>=1000 && $3<65534 {print $3; exit}' /etc/passwd)
+    _e=$(awk -F: -v u="${GUID:-x}" '$3==u {print; exit}' /etc/passwd)
+    if [ -n "$_e" ]; then
+        GUSER=$(printf '%s' "$_e" | cut -d: -f1)
+        GGID=$(printf '%s' "$_e" | cut -d: -f4)
+        GHOME=$(printf '%s' "$_e" | cut -d: -f6)
+    else
+        GUID=""   # no real user resolved; stay root
+    fi
 fi
 
-exec env PATH="$ENTER_PATH" chroot "$root" "$@"
+# Enter the layer: as the global user (full group set via setpriv
+# --init-groups, falling back to chroot --userspec) under --global, else root.
+enter()
+{
+    if [ -z "$GUID" ]; then
+        exec env PATH="$ENTER_PATH" chroot "$root" "$@"
+    fi
+    if [ -x "$root/usr/bin/setpriv" ] || [ -x "$root/bin/setpriv" ]; then
+        exec chroot "$root" /usr/bin/env \
+            "PATH=$ENTER_PATH" "HOME=$GHOME" "USER=$GUSER" "LOGNAME=$GUSER" \
+            setpriv --reuid "$GUID" --regid "$GGID" --init-groups -- "$@"
+    fi
+    exec env "PATH=$ENTER_PATH" "HOME=$GHOME" "USER=$GUSER" "LOGNAME=$GUSER" \
+        chroot --userspec="$GUID:$GGID" "$root" "$@"
+}
+
+[ "$#" -eq 0 ] && enter /bin/sh -l
+enter "$@"

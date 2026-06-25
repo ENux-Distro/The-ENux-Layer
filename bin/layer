@@ -31,7 +31,7 @@ usage()
 {
     echo "usage: layer enable <name>" >&2
     echo "       layer disable <name>" >&2
-    echo "       layer enter <name> [command [args...]]" >&2
+    echo "       layer enter [--global] [--user] <name> [command [args...]]" >&2
     echo "       layer list" >&2
     exit 2
 }
@@ -42,6 +42,15 @@ is_mounted_layer()
         /proc/self/mountinfo
 }
 
+# Operations that bind-mount and chroot need root; bail early with a clear
+# message instead of letting mount/chroot spew permission errors.
+need_root()
+{
+    [ "$(id -u)" -eq 0 ] && return 0
+    echo "layer: '$1' needs root privileges. Re-run with: sudo layer $1 ..." >&2
+    exit 1
+}
+
 [ "$#" -ge 1 ] || usage
 cmd="$1"
 shift
@@ -49,14 +58,17 @@ shift
 case "$cmd" in
 enable)
     [ "$#" -eq 1 ] || usage
+    need_root enable
     exec "$LIBEXEC_DIR/layer-enable" "$1"
     ;;
 disable)
     [ "$#" -eq 1 ] || usage
+    need_root disable
     exec "$LIBEXEC_DIR/layer-disable" "$1"
     ;;
 enter)
     [ "$#" -ge 1 ] || usage
+    need_root enter
     exec "$LIBEXEC_DIR/layer-enter" "$@"
     ;;
 list)

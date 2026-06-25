@@ -92,6 +92,19 @@ if [ "${ENUX_SHARE_GLOBAL:-0}" = 1 ]; then
         mkdir -p "$root/$gd"
         bind_if_needed "/$gd" "$root/$gd"
     done
+
+    # Mirror the base /enux into the layer so a desktop session has live,
+    # direct access to every stratum (/enux/layer/*) and the tooling, with
+    # no duplication. NON-recursive (--bind via bind_if_needed) on purpose:
+    # the strata's own /proc,/dev,self-bind submounts must NOT be pulled in,
+    # or they tangle. This shadows the layer's own copied /enux/bin etc. with
+    # the live base set. Note: /enux/layer/<this layer> then points back at
+    # the layer's own root - harmless to read, but do not re-enable/enter
+    # THIS layer from inside itself (that would recurse).
+    if [ -d /enux ]; then
+        mkdir -p "$root/enux"
+        bind_if_needed /enux "$root/enux"
+    fi
 fi
 
 # DNS: copy a real resolv.conf into the layer for the chroot session.
