@@ -12,11 +12,17 @@
 #   upgrade   upgrade all installed packages
 #   search    search for a package
 #   list      list installed packages
+#   clean     clear the downloaded-package cache
 #
-# Target layer: an explicit `layer:<name>` argument, otherwise the first
-# layer in enux's exec_order. The native package manager is detected from
-# the layer's rootfs, so `pmm install neofetch` does the right thing
-# whether that layer is Arch (pacman), Fedora (dnf), Alpine (apk)...
+# Target layer: an explicit `layer:<name>` argument always wins. Otherwise
+# the target depends on the operation (mirrors Bedrock pmm):
+#   install            first layer (exec_order priority) that HAS the package
+#   remove             every layer that has the command installed
+#   update/upgrade     every installed layer
+#   search/list        every installed layer
+# The native package manager is detected from the layer's rootfs, so
+# `pmm install neofetch` does the right thing whether the chosen layer is
+# Arch (pacman), Fedora (dnf), Alpine (apk)...
 
 set -eu
 
@@ -28,7 +34,7 @@ usage()
     cat >&2 <<'EOF'
 usage: pmm <operation> [layer:<name>] [packages...]
 
-operations: install remove update upgrade search list
+operations: install remove update upgrade search list clean
 EOF
     exit 2
 }
@@ -107,6 +113,36 @@ pm_command()
     emerge:search)    echo "emerge --search" ;;
     emerge:list)      echo "qlist -I" ;;
 
+    # clean: drop the downloaded-package cache (apt-clean style). -Scc and
+    # the noconfirm/assume-yes flags keep it non-interactive. emerge has no
+    # built-in cache clean (distfiles need gentoolkit's eclean) -> unsupported.
+    pacman:clean)         echo "pacman -Scc --noconfirm" ;;
+    apt-get:clean)        echo "apt-get clean" ;;
+    dnf:clean)            echo "dnf clean packages" ;;
+    apk:clean)            echo "apk cache clean" ;;
+    xbps-install:clean)   echo "xbps-remove -Oy" ;;
+    zypper:clean)         echo "zypper clean" ;;
+    emerge:clean)         echo "" ;;
+
+    *) ;;
+    esac
+}
+
+# Read-only "is this package available in the layer's repos?" query command
+# for a package manager. Run under a plain chroot (metadata lookups need no
+# bind mounts, which also avoids layer-enable's persistent mounts). The PM's
+# command must exit non-zero when the package is unknown. An empty mapping
+# means "no reliable check" -> caller treats that layer as unconfirmable.
+pm_available_cmd()
+{
+    case "$1" in
+    pacman)        echo "pacman -Si" ;;          # non-zero if not in sync db
+    apt-get)       echo "apt-cache show" ;;       # non-zero if unknown
+    dnf)           echo "dnf -q info" ;;
+    apk)           echo "apk add --simulate" ;;   # non-zero if unresolvable
+    xbps-install)  echo "xbps-query -R" ;;        # remote repo lookup
+    zypper)        echo "zypper -q se -x" ;;       # exact search; 104 if none
+    emerge)        echo "" ;;                      # no reliable name-only check
     *) ;;
     esac
 }
@@ -116,9 +152,16 @@ op="$1"
 shift
 
 case "$op" in
-install|remove|update|upgrade|search|list) ;;
+install|remove|update|upgrade|search|list|clean) ;;
 *) usage ;;
 esac
+
+# Every pmm operation enters a layer (chroot/mount), so all need root; bail
+# early with a clear message instead of cryptic chroot/mount errors.
+if [ "$(id -u)" -ne 0 ]; then
+    echo "pmm: '$op' needs root privileges. Re-run with: sudo pmm $op ..." >&2
+    exit 1
+fi
 
 # Optional explicit target: layer:<name>
 layer=""
@@ -160,6 +203,54 @@ default_layer()
     installed_layers | head -n1
 }
 
+# Layers in resolution priority: exec_order first, then any remaining
+# installed layers (matches enux's cross ordering).
+priority_layers()
+{
+    _conf="${ENUX_CONF:-/enux/etc/enux.conf}"
+    _ordered=""
+    # Word-splitting intended: exec_order layer names, space-separated.
+    # shellcheck disable=SC2013
+    for _c in $(awk -F'=' '/^[ \t]*exec_order/ {gsub(/[ \t]/,"",$2); gsub(/,/," ",$2); print $2; exit}' "$_conf" 2>/dev/null); do
+        [ -d "$LAYER_DIR/$_c" ] && _ordered="$_ordered $_c"
+    done
+    for _d in "$LAYER_DIR"/*/; do
+        [ -d "$_d" ] || continue
+        _n=$(basename "$_d")
+        case " $_ordered " in *" $_n "*) ;; *) _ordered="$_ordered $_n" ;; esac
+    done
+    # Word-splitting intended: emit the names space-separated for the caller.
+    # shellcheck disable=SC2086
+    echo $_ordered
+}
+
+# Is a package available in a layer's repos? 0 = yes, non-zero = no/unknown.
+# sh -l gives the lookup a valid in-layer PATH (enux extends /etc/profile).
+pkg_available()
+{
+    _l="$1"; _pm="$2"; _pkg="$3"
+    _chk=$(pm_available_cmd "$_pm")
+    [ -n "$_chk" ] || return 1
+    chroot "$LAYER_DIR/$_l" /bin/sh -lc "$_chk \"\$1\"" sh "$_pkg" >/dev/null 2>&1
+}
+
+# Pick the first priority layer whose package manager has ALL the requested
+# packages available (Bedrock's "first, is-package-available"). Returns 1 if
+# none can be confirmed, so the caller falls back to the default layer rather
+# than regressing.
+find_install_layer()
+{
+    for _l in $(priority_layers); do
+        _pm=$(detect_pm "$LAYER_DIR/$_l") || continue
+        _all=1
+        for _p in "$@"; do
+            pkg_available "$_l" "$_pm" "$_p" || { _all=0; break; }
+        done
+        [ "$_all" = 1 ] && { echo "$_l"; return 0; }
+    done
+    return 1
+}
+
 # Run op in one layer with the given packages; returns the PM's exit status.
 run_in_layer()
 {
@@ -198,12 +289,30 @@ elif [ "$op" = remove ]; then
         if run_in_layer "$l" $present; then :; else rc=$?; fi
     done
     [ "$found" = 1 ] || { echo "pmm: '$*' not found in any layer" >&2; exit 1; }
-else
-    # No explicit target: default to the first installed layer.
-    target=$(default_layer)
+elif [ "$op" = install ]; then
+    # No explicit target: install into the first layer (in exec_order
+    # priority) that actually has the package(s) available, like Bedrock's
+    # pmm. Fall back to the configured default if availability can't be
+    # confirmed (e.g. indexes not synced yet, or a check-less PM).
+    target=$(find_install_layer "$@") || {
+        target=$(default_layer)
+        [ -n "$target" ] && echo "pmm: could not confirm availability; defaulting to '$target' (try 'pmm update' first, or use layer:<name>)" >&2
+    }
     [ -n "$target" ] || { echo "pmm: no installed layer to target (use layer:<name>)" >&2; exit 1; }
     if run_in_layer "$target" "$@"; then :; else rc=$?; fi
-    case "$op" in install|upgrade) mutated=1 ;; esac
+    mutated=1
+else
+    # No explicit target for update/upgrade/search/list/clean: apply to EVERY
+    # installed layer (Bedrock's "every" applicability). Refreshing/upgrading,
+    # searching, or clearing caches on just one layer ignored the rest.
+    any=0
+    for l in $(installed_layers); do
+        detect_pm "$LAYER_DIR/$l" >/dev/null 2>&1 || continue
+        any=1
+        if run_in_layer "$l" "$@"; then :; else rc=$?; fi
+    done
+    [ "$any" = 1 ] || { echo "pmm: no installed layer with a package manager" >&2; exit 1; }
+    case "$op" in upgrade) mutated=1 ;; esac
 fi
 
 # install/remove/upgrade change which commands layers provide -> refresh
