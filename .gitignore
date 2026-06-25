@@ -5,3 +5,7 @@
 # Installed layer rootfilesystems are runtime/per-build data.
 /layer/*
 !/layer/.keep
+
+# A local checkout of the separate init.c repo (ENux-Distro/init.c) sometimes
+# lives here for `make init`; it is its own repo and is never vendored.
+/init.c/

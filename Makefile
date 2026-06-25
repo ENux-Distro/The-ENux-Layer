@@ -13,9 +13,9 @@ INIT_SRC ?= ../init.c
 DESTDIR  ?=
 PREFIX   ?= /enux
 
-BIN     := bin/enux bin/layer bin/pmm bin/debinstall
+BIN     := bin/enux bin/layer bin/pmm
 LIBEXEC := libexec/layer-enable libexec/layer-disable libexec/layer-enter \
-           libexec/cross-dispatch
+           libexec/cross-dispatch libexec/layer-provision
 
 .PHONY: all init check install clean
 

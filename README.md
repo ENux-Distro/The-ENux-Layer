@@ -14,7 +14,7 @@ consistent set of commands, regardless of which distro each layer runs.
 ## Layout
 
 ```
-/enux/bin/          enux, layer, pmm, debinstall        (user commands)
+/enux/bin/          enux, layer, pmm                    (user commands)
 /enux/libexec/      layer-enable, layer-disable,
                     layer-enter, cross-dispatch          (mechanics)
 /enux/sbin/init     init.c — PID 1 (built separately; see Building)
@@ -74,17 +74,6 @@ pmm remove|update|upgrade|search|list ...
 xbps, zypper, emerge) and translates the operation, so the same command
 works everywhere. `pmm remove <pkg>` removes it from every layer that has
 it.
-
-### `debinstall` — Debian packages onto a target root
-
-```
-debinstall <package> [package...]
-```
-
-Resolves a Debian package's dependency closure via the Debian layer's apt,
-then extracts the `.debs` and runs their maintainer scripts onto a target
-root (default `/`), skipping the base's own toolchain. Niche tool; the
-layer + `pmm` workflow is the normal path.
 
 ## Building
 
