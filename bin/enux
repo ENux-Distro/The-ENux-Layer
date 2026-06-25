@@ -48,6 +48,7 @@ usage: enux install <name> [url-or-tarball-path]
        enux show <name>
        enux set-exec-order <name> [name...]
        enux exec <command> [args...]
+       enux which <command> [command...]
        enux cross
        enux configure <name>
 EOF
@@ -547,6 +548,7 @@ cmd_install()
     fetch_and_extract "$src" "$dest"
     exec_order_add "$name"
     configure_layer "$name"     # set up package repos / keys
+    "$LIBEXEC_DIR/layer-provision" "$name" || true   # host user + locale
     cross_update || true        # keep cross commands in sync; non-fatal
     copy_tooling_into_layer "$dest"   # make /enux/bin + /enux/cross available inside it
     echo "enux: '$name' installed at $dest"
@@ -617,18 +619,51 @@ cmd_exec()
     exec "$BIN_DIR/layer" enter "$first" "$@"
 }
 
+# Report what provides a command: the base directly, or (via cross) a layer.
+# Read-only - mirrors cross's base-vs-layer resolution so users can see where
+# a name will actually run from.
+cmd_which()
+{
+    [ "$#" -ge 1 ] || usage
+    _base="${CROSS_DIR%/enux/cross}"
+    [ "$_base" = "$CROSS_DIR" ] && _base=""
+    _rc=0
+    for _c in "$@"; do
+        _hit=""
+        for _bd in usr/local/sbin usr/local/bin usr/sbin usr/bin sbin bin; do
+            [ -x "$_base/$_bd/$_c" ] && { _hit="base (/$_bd/$_c)"; break; }
+        done
+        if [ -z "$_hit" ] && [ -f "$CROSS_DIR/index" ]; then
+            _hit=$(awk -v c="$_c" '$1 == c { printf "layer %s (%s, via cross)", $2, $3; exit }' "$CROSS_DIR/index")
+        fi
+        [ -n "$_hit" ] || { _hit="not found"; _rc=1; }
+        printf '%-20s %s\n' "$_c" "$_hit"
+    done
+    return "$_rc"
+}
+
+# Operations that fetch/mount or write the root-owned /enux tree need root;
+# bail early with a clear message instead of cryptic mount/permission errors.
+need_root()
+{
+    [ "$(id -u)" -eq 0 ] && return 0
+    echo "enux: '$1' needs root privileges. Re-run with: sudo enux $1 ..." >&2
+    exit 1
+}
+
 [ "$#" -ge 1 ] || usage
 cmd="$1"
 shift
 
 case "$cmd" in
-install)         cmd_install "$@" ;;
-remove)          cmd_remove "$@" ;;
+install)         need_root install;        cmd_install "$@" ;;
+remove)          need_root remove;         cmd_remove "$@" ;;
 list)            cmd_list "$@" ;;
 show)             cmd_show "$@" ;;
-set-exec-order)  cmd_set_exec_order "$@" ;;
-exec)            cmd_exec "$@" ;;
-cross)           cross_update ;;
-configure)       [ "$#" -eq 1 ] || usage; [ -d "$LAYER_DIR/$1" ] || { echo "enux: '$1' is not installed" >&2; exit 1; }; configure_layer "$1" ;;
+set-exec-order)  need_root set-exec-order; cmd_set_exec_order "$@" ;;
+exec)            need_root exec;           cmd_exec "$@" ;;
+which)           cmd_which "$@" ;;
+cross)           need_root cross;          cross_update ;;
+configure)       need_root configure; [ "$#" -eq 1 ] || usage; [ -d "$LAYER_DIR/$1" ] || { echo "enux: '$1' is not installed" >&2; exit 1; }; configure_layer "$1" ;;
 *)               usage ;;
 esac
