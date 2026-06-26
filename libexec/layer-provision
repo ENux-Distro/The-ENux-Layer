@@ -45,9 +45,20 @@ if [ -n "$gent" ]; then
         || printf '%s\n' "$gent" >> "$dest/etc/group"
 fi
 
-if [ -f "$dest/etc/shadow" ]; then
-    awk -F: -v n="$uname" '$1==n{f=1} END{exit !f}' "$dest/etc/shadow" \
-        || printf '%s:!:19000:0:99999:7:::\n' "$uname" >> "$dest/etc/shadow"
+# Shadow: copy the real password hashes from the base for the user AND root,
+# so login/sudo/su work in the layer with the user's existing passwords rather
+# than a locked account. `cat >` rewrites the existing file in place, which
+# preserves its mode/owner/group (shadow must stay group-readable for the
+# setgid-shadow unix_chkpwd helper to validate passwords).
+if [ -f "$dest/etc/shadow" ] && [ -r /etc/shadow ]; then
+    for sname in "$uname" root; do
+        sline=$(awk -F: -v n="$sname" '$1==n {print; exit}' /etc/shadow)
+        [ -n "$sline" ] || continue
+        grep -v "^$sname:" "$dest/etc/shadow" > "$dest/etc/shadow.enux" 2>/dev/null || true
+        printf '%s\n' "$sline" >> "$dest/etc/shadow.enux"
+        cat "$dest/etc/shadow.enux" > "$dest/etc/shadow"
+    done
+    rm -f "$dest/etc/shadow.enux"
 fi
 
 # --- supplementary hardware groups (audio/video/input/render/...) ---
@@ -75,6 +86,17 @@ if { [ -e "$dest/usr/bin/Xorg" ] || [ -e "$dest/usr/lib/xorg/Xorg.wrap" ]; } \
    && ! grep -qs '^allowed_users=anybody' "$dest/etc/X11/Xwrapper.config"; then
     mkdir -p "$dest/etc/X11"
     printf 'allowed_users=anybody\nneeds_root_rights=yes\n' > "$dest/etc/X11/Xwrapper.config"
+fi
+
+# --- sudo: make the ENux tooling usable under sudo inside the layer ---
+# The layer's own secure_path omits /enux, so enux/layer/pmm and cross
+# commands aren't found under sudo there. A drop-in (sorts after the distro's
+# default, so it wins) appends them. Equivalent to editing the secure_path
+# line, but safer: a malformed main sudoers would lock sudo out entirely.
+if [ -d "$dest/etc/sudoers.d" ]; then
+    printf 'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/enux/bin:/enux/cross/bin"\n' \
+        > "$dest/etc/sudoers.d/zz-enux-path"
+    chmod 0440 "$dest/etc/sudoers.d/zz-enux-path"
 fi
 
 # --- locale: generate the host's LANG inside the layer (only when needed) ---
