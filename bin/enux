@@ -487,7 +487,14 @@ cross_update()
             for f in "$root/$d"/*; do
                 [ -f "$f" ] && [ -x "$f" ] || continue
                 cmd=$(basename "$f")
-                base_has "$cmd" && continue                  # base provides it
+                # Base commands reach other layers ONLY via the enux base-mirror
+                # layer; for every other layer skip what the base already
+                # provides (keeps cross to that distro's own commands). enux is
+                # first in exec_order so it claims base commands; distro-unique
+                # ones (pacman, apt...) still resolve to their own layer.
+                if [ "$layer" != enux ] && base_has "$cmd"; then
+                    continue
+                fi
                 grep -q "^$cmd " "$index" 2>/dev/null && continue
                 # Record the command's absolute path *inside* the layer so
                 # the dispatcher can exec it directly under chroot, instead

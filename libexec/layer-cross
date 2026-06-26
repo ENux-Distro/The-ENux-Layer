@@ -1,0 +1,69 @@
+#!/bin/sh
+# layer-cross - run a command in a layer's filesystem VIEW, as the calling
+# user, without root. Uses bubblewrap (unprivileged user namespace) to present
+# the layer's own /etc, /usr, /var (so the command finds its own config) on top
+# of the base's /home and /enux, with a minimal /dev, /proc, /sys and the
+# X11/dbus/runtime sockets, and the caller's cwd preserved.
+#
+# This is what lets a cross command (run from a context where it isn't native)
+# find its configuration without sudo - e.g. a tool that reads /etc/<tool>/.
+# The layer is mounted READ-ONLY: tools that must write system files (package
+# managers) should go through pmm, which chroots with privilege.
+#
+# Usage: layer-cross <layer> <in-layer-command-path> [args...]
+
+set -eu
+
+LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+
+[ "$#" -ge 2 ] || { echo "usage: layer-cross <layer> <command> [args...]" >&2; exit 2; }
+layer="$1"; shift
+incmd="$1"; shift
+root="$LAYER_DIR/$layer"
+[ -d "$root" ] || { echo "layer-cross: layer '$layer' not found" >&2; exit 1; }
+
+# Find a working bwrap: the base's, reachable directly or via the enux mirror
+# (the latter is what is visible from inside another layer's --global session).
+bwrap=""
+for b in /usr/bin/bwrap "$LAYER_DIR/enux/usr/bin/bwrap"; do
+    [ -x "$b" ] && { bwrap="$b"; break; }
+done
+[ -n "$bwrap" ] || { echo "layer-cross: bwrap not found in the base" >&2; exit 1; }
+
+uid=$(id -u)
+home=$(getent passwd "$uid" 2>/dev/null | cut -d: -f6)
+[ -n "$home" ] || home="${HOME:-/root}"
+cwd=$(pwd 2>/dev/null || echo "$home")
+
+# bwrap mounts ONTO the read-only layer root, so a bind's destination must
+# already exist there - it cannot be created (`-try` only skips a missing
+# *source*). /home and /sys are standard, but a layer's /enux is absent on
+# installed systems (the installer excludes /enux/layer/*/enux to break the
+# rsync cycle). So bind these only when the mountpoint exists; word-splitting
+# of the fixed option strings is intentional.
+optsys="";  [ -d "$root/sys" ]  && optsys="--ro-bind-try /sys /sys"
+opthome=""; [ -d "$root/home" ] && opthome="--bind-try /home /home"
+optenux=""; { [ -d "$root/enux" ] && [ -e /enux ]; } && optenux="--ro-bind /enux /enux"
+
+# Scratch on tmpfs (writable), so /tmp/.X11-unix and /run/* mountpoints below
+# are created there rather than on the read-only root. The trailing "$@" still
+# holds the command's arguments (we shifted off layer + cmd).
+# shellcheck disable=SC2086
+exec "$bwrap" \
+    --ro-bind "$root" / \
+    --dev /dev --proc /proc \
+    --tmpfs /tmp --tmpfs /var/tmp --tmpfs /run \
+    $optsys $opthome $optenux \
+    --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix \
+    --bind-try "/run/user/$uid" "/run/user/$uid" \
+    --ro-bind-try /run/dbus /run/dbus \
+    --setenv HOME "$home" \
+    --setenv USER "${USER:-}" \
+    --setenv LOGNAME "${LOGNAME:-${USER:-}}" \
+    --setenv PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/enux/bin:/enux/cross/bin" \
+    --setenv DISPLAY "${DISPLAY:-}" \
+    --setenv XAUTHORITY "${XAUTHORITY:-}" \
+    --setenv XDG_RUNTIME_DIR "${XDG_RUNTIME_DIR:-}" \
+    --setenv WAYLAND_DISPLAY "${WAYLAND_DISPLAY:-}" \
+    --chdir "$cwd" \
+    "$incmd" "$@"

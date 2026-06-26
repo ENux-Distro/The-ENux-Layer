@@ -14,6 +14,8 @@ set -eu
 CROSS_DIR="${CROSS_DIR:-/enux/cross}"
 CROSS_INDEX="${CROSS_INDEX:-$CROSS_DIR/index}"
 BIN_DIR="${BIN_DIR:-/enux/bin}"
+LAYER_DIR="${LAYER_DIR:-/enux/layer}"
+LIBEXEC_DIR="${LIBEXEC_DIR:-/enux/libexec}"
 
 # Remove the cross dir from PATH first, so this script's own helpers
 # (basename, awk) and the `layer` it execs resolve to base binaries and
@@ -41,6 +43,28 @@ fi
 layer=${entry%% *}
 inpath=${entry#* }
 
-# Exec the command's absolute in-layer path so it doesn't depend on PATH
-# resolution inside the chroot.
+# The enux layer is the ENux base itself - its commands need no separate
+# filesystem view, so run them via the base's own dynamic loader: a single
+# exec, no namespace setup, no root. (The caller's uid, cwd and /home are
+# preserved since it runs in the current namespace.)
+if [ "$layer" = enux ]; then
+    el="$LAYER_DIR/enux"
+    ld=""
+    for c in "$el"/lib64/ld-linux-*.so.*; do
+        [ -e "$c" ] && { ld="$c"; break; }
+    done
+    if [ -n "$ld" ] && [ -x "$el$inpath" ]; then
+        exec "$ld" --library-path "$el/usr/lib:$el/usr/lib64:$el/lib64:$el/lib" \
+            "$el$inpath" "$@"
+    fi
+fi
+
+# Every other layer runs in its OWN view via layer-cross (bubblewrap): it sees
+# its own /etc, /usr, /var (finds its config) over the base's /home, as the
+# caller, with no root - the fix for "the tool can't find /etc/<tool>/".
+if [ -x "$LIBEXEC_DIR/layer-cross" ]; then
+    exec "$LIBEXEC_DIR/layer-cross" "$layer" "$inpath" "$@"
+fi
+
+# Last resort (no bwrap / no layer-cross): privileged chroot enter (needs root).
 exec "$BIN_DIR/layer" enter "$layer" "$inpath" "$@"

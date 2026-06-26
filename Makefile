@@ -15,7 +15,7 @@ PREFIX   ?= /enux
 
 BIN     := bin/enux bin/layer bin/pmm
 LIBEXEC := libexec/layer-enable libexec/layer-disable libexec/layer-enter \
-           libexec/cross-dispatch libexec/layer-provision
+           libexec/cross-dispatch libexec/layer-provision libexec/layer-cross
 
 .PHONY: all init check install clean
 
