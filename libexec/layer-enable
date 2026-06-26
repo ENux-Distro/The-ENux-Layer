@@ -35,6 +35,20 @@ is_mounted()
     awk -v p="$1" '$5 == p { found=1 } END { exit !found }' /proc/self/mountinfo
 }
 
+# mount(1) prints a "your fstab has been modified, run systemctl daemon-reload"
+# hint on every call when /etc/fstab's mtime is newer than systemd's last
+# reload (e.g. a future-dated fstab from a skewed install clock). It is pure
+# noise for our internal binds, so drop just that hint while preserving real
+# errors and the exit status.
+do_mount()
+{
+    if _e=$(mount "$@" 2>&1 1>/dev/null); then _rc=0; else _rc=$?; fi
+    if [ -n "$_e" ]; then
+        printf '%s\n' "$_e" | grep -viE 'hint|daemon-reload|fstab' >&2 || true
+    fi
+    return "$_rc"
+}
+
 bind_if_needed()
 {
     src="$1"
@@ -42,7 +56,7 @@ bind_if_needed()
     if is_mounted "$dst"; then
         return 0
     fi
-    mount --bind "$src" "$dst"
+    do_mount --bind "$src" "$dst"
 }
 
 # Self-bind first - everything else depends on $root having a mountinfo
@@ -51,7 +65,7 @@ bind_if_needed()
 # do underneath it (proc, sys, dev...) gets propagated back through both
 # paths to the same directory and shows up twice in mountinfo.
 bind_if_needed "$root" "$root"
-mount --make-private "$root"
+do_mount --make-private "$root"
 
 mkdir -p "$root/proc" "$root/sys" "$root/dev" "$root/dev/pts"
 bind_if_needed /proc "$root/proc"
