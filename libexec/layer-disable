@@ -46,4 +46,3 @@ while :; do
     fi
 done
 
-echo "layer-disable: '$name' detached"

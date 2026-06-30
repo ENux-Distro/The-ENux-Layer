@@ -20,7 +20,7 @@ CC       ?= cc
 # layer's loader there. Static side-steps that entirely.
 CFLAGS   ?= -O2 -Wall -Wextra
 
-BIN     := bin/enux bin/layer bin/pmm
+BIN     := bin/enux bin/layer bin/pmm bin/install-xfce bin/Start-XFCE bin/nm-tui
 # Shell scripts only (these are what `make check` syntax-checks).
 LIBEXEC := libexec/layer-enable libexec/layer-disable libexec/layer-enter \
            libexec/cross-dispatch libexec/layer-provision libexec/layer-cross

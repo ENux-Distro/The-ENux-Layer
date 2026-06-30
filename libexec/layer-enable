@@ -148,4 +148,3 @@ for hf in /etc/hostname /etc/hosts; do
     [ -e "$hf" ] && cp -L "$hf" "$root$hf" 2>/dev/null || true
 done
 
-echo "layer-enable: '$name' ready at $root"
