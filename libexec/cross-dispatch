@@ -43,6 +43,30 @@ fi
 layer=${entry%% *}
 inpath=${entry#* }
 
+# Package managers: when already root, run via a privileged chroot into the
+# owning layer (same path pmm uses) and refresh the cross index after so
+# newly installed commands are typeable immediately. When NOT root, fall
+# through to layer-chroot below - read ops (search/show/list) work fine as
+# the user; write ops (install/remove) will fail with "permission denied" so
+# the user knows to prefix with sudo, exactly like on any normal system.
+# No auto-sudo: the user decides when to escalate.
+case "$cmd" in
+apt|apt-get|aptitude|dpkg|dnf|dnf5|yum|microdnf|rpm|pacman|apk|\
+xbps-install|xbps-remove|xbps-query|zypper|emerge)
+    if [ "$(id -u)" = 0 ]; then
+        "$BIN_DIR/layer" enter "$layer" "$inpath" "$@"
+        rc=$?
+        # Rebuild cross index synchronously so new commands exist before the
+        # prompt returns. Synchronous is required: a background rebuild leaves
+        # a window where the symlink does not exist yet, and bash's hash table
+        # caches the "not found" result for the life of the shell.
+        printf '[enux] cross is rebuilding...\n' >&2
+        "$BIN_DIR/enux" cross >/dev/null 2>&1 || true
+        exit "$rc"
+    fi
+    ;;
+esac
+
 # The enux layer is the ENux base itself - its commands need no separate
 # filesystem view, so run them via the base's own dynamic loader: a single
 # exec, no namespace setup, no root. (The caller's uid, cwd and /home are
@@ -59,9 +83,19 @@ if [ "$layer" = enux ]; then
     fi
 fi
 
-# Every other layer runs in its OWN view via layer-cross (bubblewrap): it sees
-# its own /etc, /usr, /var (finds its config) over the base's /home, as the
-# caller, with no root - the fix for "the tool can't find /etc/<tool>/".
+# Every other layer: run the command in its layer's FULL view, as the calling
+# user, via layer-chroot - a cap_sys_chroot helper inspired by Bedrock Linux
+# 1.0beta1. Plain chroot (no user namespace) works on the base AND nested
+# inside a --gui desktop chroot, needs no sudo, and gives the command its own
+# /etc,/usr + interpreters (scripts, rpm's rpmrc, GUI apps all work with the
+# user's own identity and X authority). Primary path; the layer must already be
+# enabled (boot-time init.c does this for every layer).
+if [ -x "$LIBEXEC_DIR/layer-chroot" ]; then
+    exec "$LIBEXEC_DIR/layer-chroot" "$layer" "$inpath" "$@"
+fi
+
+# Fallback (no layer-chroot): layer-cross (bubblewrap) - own view as the caller,
+# no root, but limited inside a chroot (no nested userns) and unable to run scripts.
 if [ -x "$LIBEXEC_DIR/layer-cross" ]; then
     exec "$LIBEXEC_DIR/layer-cross" "$layer" "$inpath" "$@"
 fi

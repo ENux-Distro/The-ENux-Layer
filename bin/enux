@@ -443,9 +443,15 @@ cross_update()
         exit 1
     fi
 
-    rm -rf "$bindir"
-    mkdir -p "$bindir"
-    : > "$index"
+    # Build into temporaries and swap at the end, so the live $bindir/$index
+    # are never seen empty or half-built. A naive rm+recreate leaves a
+    # multi-second window where 'command not found' hits any concurrent lookup
+    # (e.g. an auto-refresh after a package install racing the next command).
+    newbin="$CROSS_DIR/.bin.new.$$"
+    newindex="$CROSS_DIR/.index.new.$$"
+    rm -rf "$newbin"
+    mkdir -p "$newbin" "$CROSS_DIR"
+    : > "$newindex"
 
     # Base root that owns this cross dir: /enux/cross -> "" (i.e. /), or
     # /mnt/lfs2/enux/cross -> /mnt/lfs2. Commands the base already provides
@@ -495,16 +501,25 @@ cross_update()
                 if [ "$layer" != enux ] && base_has "$cmd"; then
                     continue
                 fi
-                grep -q "^$cmd " "$index" 2>/dev/null && continue
+                grep -q "^$cmd " "$newindex" 2>/dev/null && continue
                 # Record the command's absolute path *inside* the layer so
                 # the dispatcher can exec it directly under chroot, instead
                 # of relying on PATH resolution (Alpine's apk is in /sbin,
                 # which the caller's PATH may not include).
-                echo "$cmd $layer /$d/$cmd" >> "$index"
-                ln -sf "$dispatch" "$bindir/$cmd"
+                echo "$cmd $layer /$d/$cmd" >> "$newindex"
+                ln -sf "$dispatch" "$newbin/$cmd"
             done
         done
     done
+
+    # Swap into place. The index is one atomic rename. The bin dir is swapped
+    # with two quick renames (a microsecond window) instead of the seconds-long
+    # rebuild, so concurrent lookups effectively never miss.
+    mv -f "$newindex" "$index"
+    rm -rf "$bindir.old"
+    [ -e "$bindir" ] && mv "$bindir" "$bindir.old"
+    mv "$newbin" "$bindir"
+    rm -rf "$bindir.old"
     echo "enux: cross commands updated ($(wc -l < "$index" | tr -d ' ') commands)"
 )
 
