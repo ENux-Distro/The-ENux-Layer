@@ -140,17 +140,11 @@ The init component (`sbin/init`) is the static binary from the separate
 `../init.c`. The tooling is fully usable without init for manual layer work;
 init is only required for boot-time layer enablement.
 
-## Putting it in an ISO
-
-See [ISO.md](ISO.md) for the full live-ISO procedure, including the mandatory
-step of disabling every layer before `mksquashfs` (enabled layers bind-mount
-the host's live `/proc` and `/dev`, which must never be baked into an image).
-
 ## Status
 
 More Stable. The commands work and are tested on read-only squashfs roots and
 in a booted live ISO. Cross-layer command execution, package managers by name,
-and the XFCE desktop session are all verified. See [CONTRIBUTING.md](CONTRIBUTING.md) to help.
+and the XFCE desktop session are all verified.
 
 ## License
 
