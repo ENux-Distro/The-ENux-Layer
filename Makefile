@@ -13,13 +13,30 @@ INIT_SRC ?= ../init.c
 DESTDIR  ?=
 PREFIX   ?= /enux
 
+CC       ?= cc
+# layer-chroot is built static and depends only on libc: it runs in the base
+# AND, when a cross command is invoked from inside another layer's chroot, as a
+# base binary reached via the /enux bind - a dynamic build would try the wrong
+# layer's loader there. Static side-steps that entirely.
+CFLAGS   ?= -O2 -Wall -Wextra
+
 BIN     := bin/enux bin/layer bin/pmm
+# Shell scripts only (these are what `make check` syntax-checks).
 LIBEXEC := libexec/layer-enable libexec/layer-disable libexec/layer-enter \
            libexec/cross-dispatch libexec/layer-provision libexec/layer-cross
+# Compiled helper (build artifact, not a shell script). cap_sys_chroot is set
+# at install/ISO-build time, not here.
+LIBEXEC_BIN := libexec/layer-chroot
 
-.PHONY: all init check install clean
+.PHONY: all init layer-chroot check install clean
 
-all: init
+all: init layer-chroot
+
+# layer-chroot: a cap_sys_chroot helper that runs a command in a layer as the
+# calling user with no sudo. See src/layer-chroot/layer-chroot.c.
+layer-chroot: $(LIBEXEC_BIN)
+$(LIBEXEC_BIN): src/layer-chroot/layer-chroot.c
+	$(CC) -static $(CFLAGS) -o $@ $<
 
 # Build init from the separate init.c repo and drop it in sbin/. The Layer
 # tooling works without it (manual `layer enter` / `pmm`); init is only
@@ -51,6 +68,16 @@ install:
 	           "$(DESTDIR)$(PREFIX)/layer" "$(DESTDIR)$(PREFIX)/cross/bin"
 	install -m 0755 $(BIN)     "$(DESTDIR)$(PREFIX)/bin/"
 	install -m 0755 $(LIBEXEC) "$(DESTDIR)$(PREFIX)/libexec/"
+	@# layer-chroot + its cap_sys_chroot capability. Needs root and an xattr-capable
+	@# filesystem; mksquashfs -xattrs then carries the cap into the image.
+	@if [ -x libexec/layer-chroot ]; then \
+		install -m 0755 libexec/layer-chroot "$(DESTDIR)$(PREFIX)/libexec/layer-chroot"; \
+		setcap cap_sys_chroot=ep "$(DESTDIR)$(PREFIX)/libexec/layer-chroot" \
+			&& echo "set cap_sys_chroot on layer-chroot" \
+			|| echo "warning: setcap on layer-chroot failed - run as root: setcap cap_sys_chroot=ep $(DESTDIR)$(PREFIX)/libexec/layer-chroot" >&2; \
+	else \
+		echo "warning: libexec/layer-chroot not built - run 'make layer-chroot' (cross falls back to bwrap without it)" >&2; \
+	fi
 	install -m 0644 etc/os-release "$(DESTDIR)$(PREFIX)/etc/"
 	install -D -m 0644 etc/enux.sh "$(DESTDIR)/etc/profile.d/enux.sh"
 	@# Never clobber an existing enux.conf - it holds the user's exec_order.
@@ -66,4 +93,4 @@ install:
 	fi
 
 clean:
-	rm -f sbin/init
+	rm -f sbin/init libexec/layer-chroot
