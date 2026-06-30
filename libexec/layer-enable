@@ -90,6 +90,15 @@ if [ -d /run/udev ]; then
     bind_if_needed /run/udev "$root/run/udev"
 fi
 
+# Share the base's /home into EVERY enabled layer (not only --global sessions).
+# Cross commands run via layer-chroot in the layer's own filesystem view but as the real
+# user, so they need that user's home - configs, caches, ~/.Xauthority - to
+# behave correctly. Bedrock Linux shares /home by default for the same reason.
+if [ -d /home ]; then
+    mkdir -p "$root/home"
+    bind_if_needed /home "$root/home"
+fi
+
 # Global view (ENUX_SHARE_GLOBAL=1): share the base system's user data and
 # runtime into the layer so a desktop session run from the layer operates
 # on the real ENux home, drives, processes, and system bus rather than the
@@ -131,5 +140,12 @@ if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
     rm -f "$root/etc/resolv.conf"
     cp -L /etc/resolv.conf "$root/etc/resolv.conf" 2>/dev/null || true
 fi
+
+# Hostname resolution: the layer's own /etc/hosts and /etc/hostname don't know
+# the base's hostname, so anything that resolves it (sudo, X) warns/fails with
+# "unable to resolve host <name>". Copy the base's in so the layer agrees.
+for hf in /etc/hostname /etc/hosts; do
+    [ -e "$hf" ] && cp -L "$hf" "$root$hf" 2>/dev/null || true
+done
 
 echo "layer-enable: '$name' ready at $root"

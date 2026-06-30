@@ -97,6 +97,16 @@ if [ -d "$dest/etc/sudoers.d" ]; then
     printf 'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/enux/bin:/enux/cross/bin"\n' \
         > "$dest/etc/sudoers.d/zz-enux-path"
     chmod 0440 "$dest/etc/sudoers.d/zz-enux-path"
+
+    # Grant the user sudo IN the layer if they are an admin on the base. The
+    # base's admin group is 'wheel', but distros gate sudo on different groups
+    # (Debian: 'sudo', most others: 'wheel') and may not even ship the base's
+    # group - so chasing group names is fragile. Grant the user directly via a
+    # drop-in instead: robust across every layer's sudoers convention.
+    if id -nG "$uname" 2>/dev/null | tr ' ' '\n' | grep -qxE 'wheel|sudo'; then
+        printf '%s ALL=(ALL:ALL) ALL\n' "$uname" > "$dest/etc/sudoers.d/zz-enux-admin"
+        chmod 0440 "$dest/etc/sudoers.d/zz-enux-admin"
+    fi
 fi
 
 # --- locale: generate the host's LANG inside the layer (only when needed) ---

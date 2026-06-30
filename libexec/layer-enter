@@ -15,20 +15,30 @@ LAYER_DIR="${LAYER_DIR:-/enux/layer}"
 # Flags (any order, before the layer name):
 #   --global  also share the base's home/drives/runtime into the layer (see
 #             layer-enable), so a desktop operates on the real ENux root.
-#   --user    run the command as the invoking real user (uid 1000-style)
-#             instead of root. Root-needing tasks (apt, the NetworkManager
-#             daemon) must NOT use this; a desktop session should.
+#   --user    run as the invoking real user via BWRAP (pivot_root, not chroot).
+#             Use for terminals, commands and scripts: because it is not a
+#             chroot, cross commands inside it can nest a namespace and find
+#             their own /etc and /usr (rpm/dnf/apk work). Cannot run an X
+#             *server* (bwrap neuters setuid, which Xorg.wrap needs).
+#   --gui     run as the invoking real user via CHROOT + setpriv. Use for a
+#             desktop session (startxfce4): setuid Xorg.wrap works, so X gets
+#             VT/DRM access. Trade-off: being a chroot, cross commands launched
+#             from inside it are ABI-only (the kernel blocks namespaces in a
+#             chroot) - open a separate `--user` session for cross work.
+# Root-needing tasks (apt, the NetworkManager daemon) use neither flag.
 ENUX_AS_USER=0
+ENUX_GUI=0
 while :; do
     case "${1:-}" in
         --global) export ENUX_SHARE_GLOBAL=1; shift ;;
         --user)   ENUX_AS_USER=1; shift ;;
+        --gui)    ENUX_GUI=1; shift ;;
         *)        break ;;
     esac
 done
 
 if [ "$#" -lt 1 ]; then
-    echo "usage: layer-enter [--global] [--user] <name> [command [args...]]" >&2
+    echo "usage: layer-enter [--global] [--user|--gui] <name> [command [args...]]" >&2
     exit 2
 fi
 
@@ -36,43 +46,54 @@ name="$1"
 shift
 root="$LAYER_DIR/$name"
 
-"$LIBEXEC_DIR/layer-enable" "$name"
-
-# Give the chrooted command a standard PATH plus the ENux tooling and
-# cross-command dirs. chroot resolves the command name with the PATH it
-# inherits; the caller's may omit /sbin (where Alpine's apk lives), and a
-# command-form enter never sources /etc/profile, so set it here. The
-# standard dirs come first (the layer's own programs win); /enux/bin and
-# /enux/cross/bin are appended so `enux`/`layer`/`pmm` and other strata's
-# commands are reachable without overriding native ones.
+# Standard PATH plus the ENux tooling and cross-command dirs. A command-form
+# enter never sources /etc/profile, and the caller's PATH may omit /sbin
+# (where Alpine's apk lives), so set it here. The layer's own dirs come first
+# (its programs win); /enux/bin and /enux/cross/bin are appended so
+# `enux`/`layer`/`pmm` and other strata's commands resolve without overriding
+# native ones.
 ENTER_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/enux/bin:/enux/cross/bin"
 
-# With --user, run as the invoking real user, not root. Ensure that user
-# exists in the layer (this lazily provisions the pre-shipped layers, which
-# had no user at ISO-build time), then resolve their uid/gid/home so we can
-# drop to them after chroot. Without --user we stay root (apt, NM daemon, etc).
-GUID=""; GGID=""; GHOME=""; GUSER=""
-if [ "$ENUX_AS_USER" = 1 ]; then
+# Resolve the real user (for --user and --gui): provision it into the layer
+# (lazily fixes pre-shipped layers that had no user at build time) then read
+# its uid/gid/home from the base passwd. Sets GUID/GGID/GHOME/GUSER (GUID may
+# end up empty on a base with no real user - e.g. a bare live console).
+resolve_user()
+{
     "$LIBEXEC_DIR/layer-provision" "$name" >/dev/null 2>&1 || true
     GUID="${SUDO_UID:-}"
-    [ -n "$GUID" ] || GUID=$(awk -F: '$3>=1000 && $3<65534 {print $3; exit}' /etc/passwd)
+    [ -n "$GUID" ] || GUID=$(id -u)
+    [ "$GUID" = 0 ] && GUID=$(awk -F: '$3>=1000 && $3<65534 {print $3; exit}' /etc/passwd)
+    GUSER=""; GGID=""; GHOME=""
     _e=$(awk -F: -v u="${GUID:-x}" '$3==u {print; exit}' /etc/passwd)
     if [ -n "$_e" ]; then
         GUSER=$(printf '%s' "$_e" | cut -d: -f1)
         GGID=$(printf '%s' "$_e" | cut -d: -f4)
         GHOME=$(printf '%s' "$_e" | cut -d: -f6)
     else
-        GUID=""   # no real user resolved; stay root
+        GUID=""
     fi
-fi
+    [ -n "$GUID" ] && [ -z "$GGID" ] && GGID="$GUID"
+    # Always succeed: a trailing && that evaluates false would make this
+    # function return non-zero and trip the script's `set -e`.
+    return 0
+}
 
-# Enter the layer: as the global user (full group set via setpriv
-# --init-groups, falling back to chroot --userspec) under --global, else root.
-enter()
-{
+# ---------------------------------------------------------------------------
+# --gui: privileged DESKTOP session. CHROOT + drop to the user with setpriv
+# --init-groups (full group set for /dev/dri,/dev/input). setuid Xorg.wrap
+# works here (no bwrap = no no_new_privs), so the X server gets VT/DRM access.
+# Cross commands launched from inside are ABI-only (chroot blocks namespaces);
+# use a separate `--user` session for cross work.
+# ---------------------------------------------------------------------------
+if [ "$ENUX_GUI" = 1 ]; then
+    resolve_user
+    "$LIBEXEC_DIR/layer-enable" "$name"
     if [ -z "$GUID" ]; then
+        # No real user to drop to (bare console): run the desktop as root.
         exec env PATH="$ENTER_PATH" chroot "$root" "$@"
     fi
+    [ "$#" -eq 0 ] && set -- /bin/sh -l
     if [ -x "$root/usr/bin/setpriv" ] || [ -x "$root/bin/setpriv" ]; then
         exec chroot "$root" /usr/bin/env \
             "PATH=$ENTER_PATH" "HOME=$GHOME" "USER=$GUSER" "LOGNAME=$GUSER" \
@@ -80,6 +101,92 @@ enter()
     fi
     exec env "PATH=$ENTER_PATH" "HOME=$GHOME" "USER=$GUSER" "LOGNAME=$GUSER" \
         chroot --userspec="$GUID:$GGID" "$root" "$@"
+fi
+
+# ---------------------------------------------------------------------------
+# --user sessions go through bwrap (pivot_root), NOT chroot. This is the whole
+# point: the kernel forbids creating an unprivileged user namespace inside a
+# chroot (current_chrooted() -> -EPERM), but a bwrap session uses pivot_root,
+# so it is NOT chrooted and CAN nest namespaces. That lets a cross command run
+# its own bwrap view from inside the session and find its own /etc and
+# /usr/lib (rpm/dnf/GUI apps work) - impossible from a chroot session.
+#
+# Root sessions (no --user: apt, the NM daemon) keep the classic
+# layer-enable + chroot path further down; they need to write the layer's
+# system files and a persistent set of host binds.
+# ---------------------------------------------------------------------------
+if [ "$ENUX_AS_USER" = 1 ]; then
+    resolve_user
+
+    bw=""
+    for b in /usr/bin/bwrap "$LAYER_DIR/enux/usr/bin/bwrap"; do
+        [ -x "$b" ] && { bw="$b"; break; }
+    done
+    [ -n "$bw" ] || { echo "layer-enter: bwrap not found (required for --user sessions)" >&2; exit 1; }
+
+    # --global: share the base's user data and runtime so a desktop session
+    # operates on the real ENux home/drives/bus and sees every stratum via the
+    # live /enux. Only bind what exists on the base. (Mirrors layer-enable's
+    # global set; /root is intentionally not shared - ~/.xinitrc must stay the
+    # layer's.) Fixed, space-free paths -> intentional word-split.
+    gopts=""
+    if [ "${ENUX_SHARE_GLOBAL:-0}" = 1 ]; then
+        for gd in home mnt media opt srv run/dbus run/user; do
+            [ -e "/$gd" ] && gopts="$gopts --bind /$gd /$gd"
+        done
+        [ -d /enux ] && gopts="$gopts --bind /enux /enux"
+    fi
+
+    hopts=""; [ -n "$GHOME" ] && hopts="--setenv HOME $GHOME --chdir $GHOME"
+    uopts=""; [ -n "$GUSER" ] && uopts="--setenv USER $GUSER --setenv LOGNAME $GUSER"
+
+    # Drop to the real user. As root (the usual `sudo layer enter` / boot-GUI
+    # case) use the LAYER's setpriv with --init-groups to keep the full
+    # supplementary group set - desktops need it for /dev/dri and /dev/input.
+    # bwrap run as root stays in the host user namespace, so setgroups is
+    # permitted (an unprivileged userns could not do this). If the layer has
+    # no setpriv, fall back to bwrap's own --uid/--gid (primary group only).
+    # When already unprivileged, run as-is (bwrap maps the caller 1:1).
+    pre=""; idopts=""
+    if [ "$(id -u)" = 0 ] && [ -n "$GUID" ]; then
+        if [ -x "$root/usr/bin/setpriv" ]; then
+            pre="/usr/bin/setpriv --reuid $GUID --regid $GGID --init-groups --"
+        elif [ -x "$root/bin/setpriv" ]; then
+            pre="/bin/setpriv --reuid $GUID --regid $GGID --init-groups --"
+        else
+            idopts="--uid $GUID --gid $GGID"
+        fi
+    fi
+
+    [ "$#" -eq 0 ] && set -- /bin/sh -l
+
+    # --bind (rw) the layer as the root via pivot_root; full /dev for devices,
+    # fresh /proc, read-only /sys; share X11 socket, udev db and DNS. The
+    # session leaves NO persistent host mounts (unlike chroot) - they vanish
+    # when it exits, so there is nothing to `layer disable`.
+    # shellcheck disable=SC2086
+    exec "$bw" \
+        --bind "$root" / \
+        --dev-bind /dev /dev \
+        --proc /proc \
+        --ro-bind-try /sys /sys \
+        --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix \
+        --ro-bind-try /run/udev /run/udev \
+        --ro-bind-try /etc/resolv.conf /etc/resolv.conf \
+        --ro-bind-try /etc/hosts /etc/hosts \
+        --ro-bind-try /etc/hostname /etc/hostname \
+        $gopts \
+        --setenv PATH "$ENTER_PATH" \
+        $hopts $uopts $idopts \
+        $pre "$@"
+fi
+
+# --- Root session: classic enable + chroot --------------------------------
+"$LIBEXEC_DIR/layer-enable" "$name"
+
+enter()
+{
+    exec env PATH="$ENTER_PATH" chroot "$root" "$@"
 }
 
 [ "$#" -eq 0 ] && enter /bin/sh -l

@@ -1,14 +1,26 @@
 #!/bin/sh
 # layer-cross - run a command in a layer's filesystem VIEW, as the calling
-# user, without root. Uses bubblewrap (unprivileged user namespace) to present
-# the layer's own /etc, /usr, /var (so the command finds its own config) on top
-# of the base's /home and /enux, with a minimal /dev, /proc, /sys and the
-# X11/dbus/runtime sockets, and the caller's cwd preserved.
+# user, without root. Two mechanisms, picked at runtime:
 #
-# This is what lets a cross command (run from a context where it isn't native)
-# find its configuration without sudo - e.g. a tool that reads /etc/<tool>/.
-# The layer is mounted READ-ONLY: tools that must write system files (package
-# managers) should go through pmm, which chroots with privilege.
+#   1. bubblewrap (preferred): an unprivileged user namespace presents the
+#      layer's own /etc,/usr,/var (so the command finds its own config) over
+#      the base's /home and /enux, with a minimal /dev,/proc,/sys and the
+#      X11/dbus/runtime sockets. Full isolation, correct /etc.
+#
+#   2. loader trick (fallback): run the layer's binary through its OWN ld.so
+#      with an explicit --library-path, no namespace. The command gets the
+#      correct ABI but runs in the CURRENT mount view (sees the current
+#      layer's /etc). Used when bwrap can't start - see the probe below.
+#
+# Why the fallback exists: the kernel FORBIDS creating an unprivileged user
+# namespace inside a chroot (current_chrooted() -> -EPERM), and a
+# `layer enter --global --user <gui>` session IS a chroot. So when a cross
+# command is run from within a layer session (e.g. a terminal inside XFCE),
+# bwrap cannot work at all and we must use the loader trick. From the base
+# (not chrooted), bwrap works and is preferred.
+#
+# The layer is mounted/seen READ-ONLY either way: tools that must write system
+# files (package managers) should go through pmm, which chroots with privilege.
 #
 # Usage: layer-cross <layer> <in-layer-command-path> [args...]
 
@@ -22,48 +34,135 @@ incmd="$1"; shift
 root="$LAYER_DIR/$layer"
 [ -d "$root" ] || { echo "layer-cross: layer '$layer' not found" >&2; exit 1; }
 
-# Find a working bwrap: the base's, reachable directly or via the enux mirror
-# (the latter is what is visible from inside another layer's --global session).
+# Always run ENux's OWN bwrap (the base-mirror layer's), never the bwrap of
+# whichever layer we happen to be called from. A foreign layer's /usr/bin/bwrap
+# may be setuid, older, or built with a different priv mode and fail to create
+# a namespace from inside the chroot ("No permissions to create a new
+# namespace"). The base bwrap is a known-good unprivileged-userns build.
+#
+# It needs base libs (newer glibc than some layers ship), so launch it through
+# the base loader with an explicit --library-path - the same trick
+# cross-dispatch uses for the enux layer. The base-mirror is reachable from
+# inside a foreign layer only under `layer enter --global` (which binds the
+# base's /enux in), which is also the only context cross commands run in.
+# $launch holds the loader prefix (empty when we fall back to a directly
+# runnable bwrap); its tokens are space-free /enux paths, so the intentional
+# word-split below is safe.
+launch=""
 bwrap=""
-for b in /usr/bin/bwrap "$LAYER_DIR/enux/usr/bin/bwrap"; do
-    [ -x "$b" ] && { bwrap="$b"; break; }
+EL="$LAYER_DIR/enux"
+ld=""
+for c in "$EL"/lib64/ld-linux-*.so.*; do
+    [ -e "$c" ] && { ld="$c"; break; }
 done
-[ -n "$bwrap" ] || { echo "layer-cross: bwrap not found in the base" >&2; exit 1; }
+if [ -n "$ld" ] && [ -x "$EL/usr/bin/bwrap" ]; then
+    launch="$ld --library-path $EL/usr/lib/x86_64-linux-gnu:$EL/usr/lib:$EL/usr/lib64:$EL/lib64:$EL/lib"
+    bwrap="$EL/usr/bin/bwrap"
+elif [ -x /usr/bin/bwrap ]; then
+    # No enux mirror reachable (e.g. running directly on the base): the base's
+    # own bwrap runs natively, no loader prefix needed.
+    bwrap="/usr/bin/bwrap"
+fi
+[ -n "$bwrap" ] || { echo "layer-cross: no usable bwrap found (need the enux base-mirror layer or /usr/bin/bwrap)" >&2; exit 1; }
 
-uid=$(id -u)
-home=$(getent passwd "$uid" 2>/dev/null | cut -d: -f6)
-[ -n "$home" ] || home="${HOME:-/root}"
-cwd=$(pwd 2>/dev/null || echo "$home")
-
-# bwrap mounts ONTO the read-only layer root, so a bind's destination must
-# already exist there - it cannot be created (`-try` only skips a missing
-# *source*). /home and /sys are standard, but a layer's /enux is absent on
-# installed systems (the installer excludes /enux/layer/*/enux to break the
-# rsync cycle). So bind these only when the mountpoint exists; word-splitting
-# of the fixed option strings is intentional.
-optsys="";  [ -d "$root/sys" ]  && optsys="--ro-bind-try /sys /sys"
-opthome=""; [ -d "$root/home" ] && opthome="--bind-try /home /home"
-optenux=""; { [ -d "$root/enux" ] && [ -e /enux ]; } && optenux="--ro-bind /enux /enux"
-
-# Scratch on tmpfs (writable), so /tmp/.X11-unix and /run/* mountpoints below
-# are created there rather than on the read-only root. The trailing "$@" still
-# holds the command's arguments (we shifted off layer + cmd).
+# Probe whether a user namespace can actually be created HERE. bwrap creates
+# the namespace before doing anything else, so a trivial sandbox running `true`
+# succeeds from the base and fails (nonzero, message suppressed) inside a
+# chroot. This decides bwrap vs the loader-trick fallback.
 # shellcheck disable=SC2086
-exec "$bwrap" \
-    --ro-bind "$root" / \
-    --dev /dev --proc /proc \
-    --tmpfs /tmp --tmpfs /var/tmp --tmpfs /run \
-    $optsys $opthome $optenux \
-    --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix \
-    --bind-try "/run/user/$uid" "/run/user/$uid" \
-    --ro-bind-try /run/dbus /run/dbus \
-    --setenv HOME "$home" \
-    --setenv USER "${USER:-}" \
-    --setenv LOGNAME "${LOGNAME:-${USER:-}}" \
-    --setenv PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/enux/bin:/enux/cross/bin" \
-    --setenv DISPLAY "${DISPLAY:-}" \
-    --setenv XAUTHORITY "${XAUTHORITY:-}" \
-    --setenv XDG_RUNTIME_DIR "${XDG_RUNTIME_DIR:-}" \
-    --setenv WAYLAND_DISPLAY "${WAYLAND_DISPLAY:-}" \
-    --chdir "$cwd" \
-    "$incmd" "$@"
+if [ -n "$bwrap" ] && $launch "$bwrap" --ro-bind / / --proc /proc --tmpfs /tmp true >/dev/null 2>&1; then
+    uid=$(id -u)
+    home=$(getent passwd "$uid" 2>/dev/null | cut -d: -f6)
+    [ -n "$home" ] || home="${HOME:-/root}"
+    cwd=$(pwd 2>/dev/null || echo "$home")
+
+    # bwrap mounts ONTO the read-only layer root, so a bind's destination must
+    # already exist there - it cannot be created (`-try` only skips a missing
+    # *source*). /home and /sys are standard, but a layer's /enux is absent on
+    # installed systems (the installer excludes /enux/layer/*/enux to break the
+    # rsync cycle). So bind these only when the mountpoint exists; word-splitting
+    # of the fixed option strings is intentional.
+    optsys="";  [ -d "$root/sys" ]  && optsys="--ro-bind-try /sys /sys"
+    opthome=""; [ -d "$root/home" ] && opthome="--bind-try /home /home"
+    optenux=""; { [ -d "$root/enux" ] && [ -e /enux ]; } && optenux="--ro-bind /enux /enux"
+
+    # Scratch on tmpfs (writable), so /tmp/.X11-unix and /run/* mountpoints
+    # below are created there rather than on the read-only root. The trailing
+    # "$@" still holds the command's arguments (we shifted off layer + cmd).
+    # shellcheck disable=SC2086
+    exec $launch "$bwrap" \
+        --ro-bind "$root" / \
+        --dev /dev --proc /proc \
+        --tmpfs /tmp --tmpfs /var/tmp --tmpfs /run \
+        $optsys $opthome $optenux \
+        --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix \
+        --bind-try "/run/user/$uid" "/run/user/$uid" \
+        --ro-bind-try /run/dbus /run/dbus \
+        --setenv HOME "$home" \
+        --setenv USER "${USER:-}" \
+        --setenv LOGNAME "${LOGNAME:-${USER:-}}" \
+        --setenv PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/enux/bin:/enux/cross/bin" \
+        --setenv DISPLAY "${DISPLAY:-}" \
+        --setenv XAUTHORITY "${XAUTHORITY:-}" \
+        --setenv XDG_RUNTIME_DIR "${XDG_RUNTIME_DIR:-}" \
+        --setenv WAYLAND_DISPLAY "${WAYLAND_DISPLAY:-}" \
+        --chdir "$cwd" \
+        "$incmd" "$@"
+fi
+
+# Fallback: no namespace here (we are inside a chroot). Run the layer's binary
+# through its OWN dynamic loader + libraries, so it executes with the correct
+# ABI even though it shares the current mount view. Both glibc and musl loaders
+# accept --library-path. A statically linked target needs no loader and is
+# exec'd directly (glibc ld.so --verify tells dynamic from static/non-ELF; for
+# musl we assume dynamic, which alpine binaries are).
+[ -x "$root$incmd" ] || { echo "layer-cross: '$incmd' not found or not executable in layer '$layer'" >&2; exit 1; }
+
+# SCRIPTS (shebang) can't use the loader trick at all: ld.so only runs ELF, and
+# exec'ing the script directly runs its absolute-path #! interpreter (e.g.
+# /usr/bin/python3 - gentoo's portageq, or the firefox wrapper) against the
+# WRONG root, so it fails with "not found". A script only works with its
+# layer's real interpreter and modules, i.e. the layer's full view - which here
+# (a chroot, no bwrap) means a privileged chroot into the layer.
+if [ "$(head -c2 "$root$incmd" 2>/dev/null)" = '#!' ]; then
+    priv="${BIN_DIR:-/enux/bin}/layer"
+    # Carry the user's display env across the privilege boundary so GUI scripts
+    # (firefox & co) can reach the X server. Pass only vars that are set, as
+    # explicit `env` assignments (immune to sudo's env reset). Space-free in
+    # practice -> the word-split is intentional.
+    denv=""
+    for _v in DISPLAY XAUTHORITY XDG_RUNTIME_DIR WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS; do
+        eval "_val=\${$_v:-}"
+        [ -n "$_val" ] && denv="$denv $_v=$_val"
+    done
+    # Already root: run as root in the layer's full view.
+    if [ "$(id -u)" = 0 ]; then
+        # shellcheck disable=SC2086
+        exec env $denv "$priv" enter "$layer" "$incmd" "$@"
+    fi
+    # Unprivileged caller (the desktop user): escalate but DROP BACK to them
+    # inside the layer (--gui = chroot + setpriv), so a GUI app keeps the user's
+    # own X authority instead of running as root with the wrong cookie.
+    # shellcheck disable=SC2086
+    exec sudo -- env $denv "$priv" enter --gui "$layer" "$incmd" "$@"
+fi
+
+rootld=""
+for c in "$root"/lib64/ld-linux-*.so.* "$root"/lib/ld-linux-*.so.* \
+         "$root"/lib/ld-musl-*.so.* "$root"/usr/lib/ld-linux-*.so.*; do
+    [ -e "$c" ] && { rootld="$c"; break; }
+done
+
+rlp="$root/usr/lib/x86_64-linux-gnu:$root/usr/lib64:$root/usr/lib:$root/lib64:$root/lib:$root/usr/local/lib"
+
+if [ -n "$rootld" ]; then
+    case "$rootld" in
+        *ld-musl*) exec "$rootld" --library-path "$rlp" "$root$incmd" "$@" ;;
+    esac
+    if "$rootld" --verify "$root$incmd" 2>/dev/null; then
+        exec "$rootld" --library-path "$rlp" "$root$incmd" "$@"
+    fi
+fi
+
+# Static binary (or no loader found): run it directly.
+exec "$root$incmd" "$@"

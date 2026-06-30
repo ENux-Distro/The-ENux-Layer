@@ -31,7 +31,7 @@ usage()
 {
     echo "usage: layer enable <name>" >&2
     echo "       layer disable <name>" >&2
-    echo "       layer enter [--global] [--user] <name> [command [args...]]" >&2
+    echo "       layer enter [--global] [--user|--gui] <name> [command [args...]]" >&2
     echo "       layer list" >&2
     exit 2
 }
