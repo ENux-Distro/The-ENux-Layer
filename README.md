@@ -14,7 +14,7 @@ consistent set of commands, regardless of which distro each layer runs.
 ## Layout
 
 ```
-/enux/bin/          enux, layer, pmm, install-xfce, Start-XFCE, nm-tui  (user commands)
+/enux/bin/          enux, layer, pmm                                      (user commands)
 /enux/libexec/      layer-enable, layer-disable, layer-enter,
                     layer-chroot, cross-dispatch, layer-cross             (mechanics)
 /enux/sbin/init     init.c — PID 1 (built separately; see Building)
@@ -112,14 +112,6 @@ Cross execution is handled by **layer-chroot** — a static C binary with the
 view as the calling user (no sudo, no user namespace), and works even when
 called from inside another chroot (e.g. the XFCE desktop session). Package
 managers that need root still require `sudo`; everything else runs as you.
-
-### Desktop helpers
-
-```
-install-xfce   install XFCE into the Debian layer (run once after enux install debian)
-Start-XFCE     launch the XFCE desktop (written by install-xfce)
-nm-tui         NetworkManager text UI (auto-starts NM and wpa_supplicant)
-```
 
 ## Building
 
