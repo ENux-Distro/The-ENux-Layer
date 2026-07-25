@@ -113,7 +113,7 @@ view as the calling user (no sudo, no user namespace), and works even when
 called from inside another chroot (e.g. the XFCE desktop session). Package
 managers that need root still require `sudo`; everything else runs as you.
 
-## Building
+## Building/Installing
 
 ```sh
 make                              # build layer-chroot (static) + init
@@ -131,6 +131,14 @@ The init component (`sbin/init`) is the static binary from the separate
 [init.c](https://github.com/ENux-Distro/init.c) repo. `INIT_SRC` defaults to
 `../init.c`. The tooling is fully usable without init for manual layer work;
 init is only required for boot-time layer enablement.
+
+## Alternative Installation Method
+
+```sh
+wget https://github.com/ENux-Distro/The-ENux-Layer/raw/refs/heads/main/The-ENux-Layer_Installer        # Installs the static installation binary
+chmod +x ./The-ENux-Layer_Installer                                                                    # Makes the static binary executable
+./The-ENux-Layer_Installer                                                                             # Runs the executable binary
+```
 
 ## Putting it in an ISO
 
