@@ -83,7 +83,10 @@ if [ -n "$bwrap" ] && $launch "$bwrap" --ro-bind / / --proc /proc --tmpfs /tmp t
     # rsync cycle). So bind these only when the mountpoint exists; word-splitting
     # of the fixed option strings is intentional.
     optsys="";  [ -d "$root/sys" ]  && optsys="--ro-bind-try /sys /sys"
-    opthome=""; [ -d "$root/home" ] && opthome="--bind-try /home /home"
+    opthome=""
+    for gd in home root tmp var/tmp mnt media srv; do
+        [ -d "$root/$gd" ] && opthome="$opthome --bind-try /$gd /$gd"
+    done
     optenux=""; { [ -d "$root/enux" ] && [ -e /enux ]; } && optenux="--ro-bind /enux /enux"
 
     # Scratch on tmpfs (writable), so /tmp/.X11-unix and /run/* mountpoints
@@ -93,7 +96,7 @@ if [ -n "$bwrap" ] && $launch "$bwrap" --ro-bind / / --proc /proc --tmpfs /tmp t
     exec $launch "$bwrap" \
         --ro-bind "$root" / \
         --dev /dev --proc /proc \
-        --tmpfs /tmp --tmpfs /var/tmp --tmpfs /run \
+        --tmpfs /run \
         $optsys $opthome $optenux \
         --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix \
         --bind-try "/run/user/$uid" "/run/user/$uid" \

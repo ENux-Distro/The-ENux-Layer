@@ -6,8 +6,9 @@
 # Bind-mounts the layer onto itself so it gets its own /proc/self/mountinfo
 # entry (without this, tools like pacman that walk mountinfo to find a
 # path's mountpoint fail with bogus "no space" errors - see commit history
-# for the reproduction), then brings in /proc, /sys, /dev, /dev/pts from
-# the host and a copy of resolv.conf for DNS.
+# for the reproduction), then rbinds the global paths (/proc, /sys, /dev,
+# /home, /root, /tmp, /mnt, /media, /srv, /run...) from the host so a cross
+# command sees the caller's cwd, and copies resolv.conf for DNS.
 #
 # Idempotent: running this twice on an already-enabled layer is a no-op.
 
@@ -67,67 +68,29 @@ bind_if_needed()
 bind_if_needed "$root" "$root"
 do_mount --make-private "$root"
 
-mkdir -p "$root/proc" "$root/sys" "$root/dev" "$root/dev/pts"
-bind_if_needed /proc "$root/proc"
-bind_if_needed /sys "$root/sys"
-bind_if_needed /dev "$root/dev"
-bind_if_needed /dev/pts "$root/dev/pts"
+# Global paths, the same in every layer, so a cross command finds the caller's
+# cwd and files. Recursive so submounts (/dev/pts, /run/user/<uid>) come
+# along; rslave so later host mounts (a USB stick in /media) show up here
+# without layer mounts leaking back to the host.
+rbind_if_needed()
+{
+    [ -d "$1" ] || return 0
+    mkdir -p "$2"
+    is_mounted "$2" && return 0
+    do_mount --rbind "$1" "$2"
+    do_mount --make-rslave "$2"
+}
 
-# Share the host's X11 socket so GUI programs in the layer can reach a
-# running display (cross-layer apps). Harmless when no X server is up.
-# /dev/dri and /dev/input come in via the /dev bind above.
-if [ -d /tmp/.X11-unix ]; then
-    mkdir -p "$root/tmp/.X11-unix"
-    bind_if_needed /tmp/.X11-unix "$root/tmp/.X11-unix"
-fi
+for gd in proc sys dev home root tmp var/tmp mnt media srv run; do
+    rbind_if_needed "/$gd" "$root/$gd"
+done
+[ "${ENUX_SHARE_GLOBAL:-0}" = 1 ] && rbind_if_needed /opt "$root/opt"
 
-# Share udev's runtime database. X's libinput driver finds input devices
-# and reads their ID_INPUT_* tags from /run/udev/data, not from /dev - so
-# without this the mouse and keyboard are dead in a layer's X session even
-# though /dev/input is present.
-if [ -d /run/udev ]; then
-    mkdir -p "$root/run/udev"
-    bind_if_needed /run/udev "$root/run/udev"
-fi
-
-# Share the base's /home into EVERY enabled layer (not only --global sessions).
-# Cross commands run via layer-chroot in the layer's own filesystem view but as the real
-# user, so they need that user's home - configs, caches, ~/.Xauthority - to
-# behave correctly. Bedrock Linux shares /home by default for the same reason.
-if [ -d /home ]; then
-    mkdir -p "$root/home"
-    bind_if_needed /home "$root/home"
-fi
-
-# Global view (ENUX_SHARE_GLOBAL=1): share the base system's user data and
-# runtime into the layer so a desktop session run from the layer operates
-# on the real ENux home, drives, processes, and system bus rather than the
-# layer's isolated copies. The layer keeps its own OS dirs (/usr, /lib,
-# /etc, /bin, /sbin, /var) - that is where its binaries, their loadable
-# modules, and config live, so X stays Debian's while "/" is ENux's where
-# it matters to the user. Each dir is shared only if it exists on the base.
-# /root is deliberately NOT shared: a desktop started with `startx` reads
-# its session config (~/.xinitrc) from the layer's /root, so replacing it
-# with the base's would break session launch. User data lives in /home.
-if [ "${ENUX_SHARE_GLOBAL:-0}" = 1 ]; then
-    for gd in home mnt media opt srv run/dbus run/user; do
-        [ -e "/$gd" ] || continue
-        mkdir -p "$root/$gd"
-        bind_if_needed "/$gd" "$root/$gd"
-    done
-
-    # Mirror the base /enux into the layer so a desktop session has live,
-    # direct access to every stratum (/enux/layer/*) and the tooling, with
-    # no duplication. NON-recursive (--bind via bind_if_needed) on purpose:
-    # the strata's own /proc,/dev,self-bind submounts must NOT be pulled in,
-    # or they tangle. This shadows the layer's own copied /enux/bin etc. with
-    # the live base set. Note: /enux/layer/<this layer> then points back at
-    # the layer's own root - harmless to read, but do not re-enable/enter
-    # THIS layer from inside itself (that would recurse).
-    if [ -d /enux ]; then
-        mkdir -p "$root/enux"
-        bind_if_needed /enux "$root/enux"
-    fi
+# Not recursive: the layers under /enux/layer carry their own submounts, and
+# pulling them in would nest every layer inside every other one.
+if [ -d /enux ]; then
+    mkdir -p "$root/enux"
+    bind_if_needed /enux "$root/enux"
 fi
 
 # DNS: copy a real resolv.conf into the layer for the chroot session.

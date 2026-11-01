@@ -67,6 +67,17 @@ xbps-install|xbps-remove|xbps-query|zypper|emerge)
     ;;
 esac
 
+# Make sure the layer is enabled, so the global paths (and with them the
+# caller's cwd) exist inside it. Only root can mount; never auto-sudo.
+if [ "$layer" != enux ] && ! awk -v p="$LAYER_DIR/$layer" '$5 == p { f=1 } END { exit !f }' /proc/self/mountinfo; then
+    if [ "$(id -u)" = 0 ]; then
+        "$LIBEXEC_DIR/layer-enable" "$layer" >/dev/null || { echo "cross: cannot enable layer '$layer'" >&2; exit 1; }
+    else
+        echo "cross: layer '$layer' is not enabled (run: sudo layer enable $layer)" >&2
+        exit 1
+    fi
+fi
+
 # The enux layer is the ENux base itself - its commands need no separate
 # filesystem view, so run them via the base's own dynamic loader: a single
 # exec, no namespace setup, no root. (The caller's uid, cwd and /home are
